@@ -1,0 +1,2490 @@
+---
+title: "eGFR decline and kidney failure by sex"
+author: "Michael Sullivan"
+date: '2024-01-25'
+output: html_document
+---
+
+```{r }
+library(tidyverse)
+library(lme4)
+library(ggeffects)
+library(finalfit)
+library(survival)
+library(RODBC)
+library(locfit)
+library(performance)
+```
+
+```{r Extract kidney function}
+#Extract sCrs
+gp_egfrs = sqlQuery(channel, 
+                      "SELECT P.ALF_PE, P.WOB, P.GNDR_CD, EVENT_VAL AS CREAT, EVENT_DT
+        FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+        LEFT JOIN SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P
+        ON E.PRAC_CD_PE = P.PRAC_CD_PE
+        AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+        WHERE EVENT_CD IN ('44J33', '44J30', '44J3z', '44J3.', 'EMISREQ|44J3', '44JF.', '44J32', '44JC.', '44JD.', '44J31', '4Q40.');")
+
+dem = sqlQuery(channel, "SELECT DISTINCT ALF_PE, WOB FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001")
+regdates <- readRDS("S:/1214 - The Relationship Between Cancer and Kidney Disease/Bhautesh/Data files/regdates.rds")
+reg = regdates %>%
+  filter(START_DATE<"2020-10-01" & END_DATE>"2013-01-01") %>%
+  left_join(dem, by="ALF_PE") %>%
+  mutate(age = as.numeric(END_DATE-WOB)/365.25) %>%
+  filter(age>18) %>%
+  mutate(time = as.numeric(END_DATE-START_DATE)) %>%
+  filter(time>90)
+
+source("new_egfr_functions_2021.R")
+egfrs = gp_egfrs %>%
+  mutate(sex = ifelse(GNDR_CD==1, 1, 0)) %>% #In SAIL, Male=1, Female=2. For package nephro, Male=1, Female=0
+  mutate(ethnic = 0) %>%
+  mutate(age = as.numeric(round((EVENT_DT-WOB)/365.25))) %>% #Calculate ages
+  filter(CREAT %in% 30:3000) %>% #Limit to realistic creatinine values
+  mutate(sCr = CREAT * 0.01131222) %>% #Change sCr umol/L to mg/dl
+  dplyr::select(ALF_PE, EVENT_DT, ethnic, sex, age, CREAT, sCr, WOB) %>%
+  mutate(MDRD_eGFR = MDRD4(sCr, sex, age, ethnic)) %>%
+  mutate(CKDEPI_eGFR = CKDEpi.creat(sCr, sex, age, ethnic)) %>%
+  mutate(new_eGFR = NoRace_eGFRcr(CREAT, age, sex))
+```
+
+```{r Identify KRT}
+krt_icd = sqlQuery(channel, 
+"SELECT ALF_PE, ADMIS_DT, D.DIAG_CD_1234 AS EVENT_CODE FROM SAIL1214V.PEDW_SPELL_20210128 S
+INNER JOIN SAIL1214V.PEDW_EPISODE_20210128 E
+ON S.PROV_UNIT_CD = E.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = E.SPELL_NUM_PE
+left JOIN SAIL1214V.PEDW_DIAG_20210128 D
+ON S.PROV_UNIT_CD = D.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = D.SPELL_NUM_PE
+and e.epi_num = d.epi_num
+where d.diag_cd_1234 IN ('E853', 'N165', 'T824', 'T861', 'Y602', 'Y612', 'Y622', 'Y841', 'Z490', 'Z491', 'Z492', 'Z940', 'Z992')"
+)
+
+krt_maintenance_icd = sqlQuery(channel, 
+"SELECT ALF_PE, ADMIS_DT, D.DIAG_CD_1234 AS EVENT_CODE FROM SAIL1214V.PEDW_SPELL_20210128 S
+INNER JOIN SAIL1214V.PEDW_EPISODE_20210128 E
+ON S.PROV_UNIT_CD = E.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = E.SPELL_NUM_PE
+left JOIN SAIL1214V.PEDW_DIAG_20210128 D
+ON S.PROV_UNIT_CD = D.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = D.SPELL_NUM_PE
+and e.epi_num = d.epi_num
+where d.diag_cd_1234 IN ('N165', 'T861', 'Z492', 'Z940')"
+)
+
+ckd5_icd = sqlQuery(channel, 
+"SELECT ALF_PE, ADMIS_DT, D.DIAG_CD_1234 AS EVENT_CODE FROM SAIL1214V.PEDW_SPELL_20210128 S
+INNER JOIN SAIL1214V.PEDW_EPISODE_20210128 E
+ON S.PROV_UNIT_CD = E.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = E.SPELL_NUM_PE
+left JOIN SAIL1214V.PEDW_DIAG_20210128 D
+ON S.PROV_UNIT_CD = D.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = D.SPELL_NUM_PE
+and e.epi_num = d.epi_num
+where d.diag_cd_1234 IN ('N165', 'T861', 'Z940', 'E853', 'N180', 'N185', 'Q601')"
+)
+
+krt_opcs = sqlQuery(channel, 
+"SELECT ALF_PE, ADMIS_DT, O.OPER_CD AS EVENT_CODE FROM SAIL1214V.PEDW_SPELL_20210128 S
+INNER JOIN SAIL1214V.PEDW_EPISODE_20210128 E
+ON S.PROV_UNIT_CD = E.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = E.SPELL_NUM_PE
+left JOIN SAIL1214V.PEDW_OPER_20210128 O
+ON S.PROV_UNIT_CD = O.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = O.SPELL_NUM_PE
+and e.epi_num = O.epi_num
+where O.OPER_CD IN ('M012', 'M013', 'M014', 'M015', 'M018', 'M019', 'M084', 'M174', 'M178', 'M179', 'X401', 'X402', 'X403', 'X404', 'X405', 'X406', 'X407', 'X408', 'X409', 'X411', 'X412', 'X418', 'X419', 'X421', 'X428', 'X429', 'X431')"
+)
+
+krt_maintenance_opcs = sqlQuery(channel, 
+"SELECT ALF_PE, ADMIS_DT, O.OPER_CD AS EVENT_CODE FROM SAIL1214V.PEDW_SPELL_20210128 S
+INNER JOIN SAIL1214V.PEDW_EPISODE_20210128 E
+ON S.PROV_UNIT_CD = E.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = E.SPELL_NUM_PE
+left JOIN SAIL1214V.PEDW_OPER_20210128 O
+ON S.PROV_UNIT_CD = O.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = O.SPELL_NUM_PE
+and e.epi_num = O.epi_num
+where O.OPER_CD IN ('M012', 'M013', 'M014', 'M015', 'M018', 'M019', 'M084', 'M174', 'M178', 'M179', 'X402', 'X405', 'X406', 'X411', 'X412')"
+)
+
+ckd5_opcs = sqlQuery(channel, 
+"SELECT ALF_PE, ADMIS_DT, O.OPER_CD AS EVENT_CODE FROM SAIL1214V.PEDW_SPELL_20210128 S
+INNER JOIN SAIL1214V.PEDW_EPISODE_20210128 E
+ON S.PROV_UNIT_CD = E.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = E.SPELL_NUM_PE
+left JOIN SAIL1214V.PEDW_OPER_20210128 O
+ON S.PROV_UNIT_CD = O.PROV_UNIT_CD
+AND S.SPELL_NUM_PE = O.SPELL_NUM_PE
+and e.epi_num = O.epi_num
+where O.OPER_CD IN ('M012', 'M013', 'M014', 'M015', 'M018', 'M019', 'M084', 'M174', 'M178', 'M179', 'X402', 'X405', 'X406', 'X411', 'X412', 'M172', 'M023', 'L741', 'L742', 'L743', 'L744', 'L745', 'L746', 'L748', 'L749')"
+)
+
+krt = bind_rows(krt_icd, krt_opcs) %>%
+  distinct(ALF_PE, ADMIS_DT, .keep_all = T) %>%
+  rename(krt_date = ADMIS_DT) %>%
+  rename(krt_code = EVENT_CODE)
+krt_maintenance = bind_rows(krt_maintenance_icd, krt_maintenance_opcs) %>%
+  distinct(ALF_PE, ADMIS_DT, .keep_all = T) %>%
+  rename(krt_date = ADMIS_DT) %>%
+  rename(krt_maintenance_code = EVENT_CODE)
+ckd5 = bind_rows(ckd5_icd, ckd5_opcs) %>%
+  distinct(ALF_PE, ADMIS_DT, .keep_all = T) %>%
+  rename(ckd5_date = ADMIS_DT) %>%
+  rename(ckd5_code = EVENT_CODE)
+
+kf_on_krt = krt %>%
+  inner_join(ckd5, by="ALF_PE") %>%
+  mutate(gap = as.numeric(ckd5_date-krt_date)) %>%
+  filter(ckd5_date<krt_date | between(gap, -366, 366)) %>%
+  group_by(ALF_PE) %>%
+  filter(krt_date == min(krt_date)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  bind_rows(krt_maintenance) %>%
+  group_by(ALF_PE) %>%
+  filter(krt_date == min(krt_date)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T)
+```
+
+```{r Define cohort}
+egfrs %>% distinct(ALF_PE) 
+
+decline_v2 = egfrs %>% 
+  filter(EVENT_DT>"2012-12-31" & EVENT_DT<"2021-01-01" & age>17) %>% 
+  group_by(ALF_PE) %>%
+  filter(n()>2) %>%
+  mutate(first = min(EVENT_DT)) %>%
+  mutate(last = max(EVENT_DT)) %>%
+  mutate(time_diff = as.numeric(last-first)) %>%
+  filter(time_diff>90) %>%
+  ungroup() %>%
+  arrange(ALF_PE) %>%
+  mutate(sex = as.factor(ifelse(sex==1, "Male", "Female"))) 
+```
+
+```{r Identify incident kidney failure patients}
+incident_egfr15 = decline_v2 %>%
+  arrange(ALF_PE, EVENT_DT) %>%
+  group_by(ALF_PE) %>%
+  mutate(non_kf_date = EVENT_DT[last(which(new_eGFR>15))]) %>% #Find the latest date when eGFR is >15
+  filter((EVENT_DT>non_kf_date | is.na(non_kf_date)) & new_eGFR<15) %>%
+  mutate(first = min(EVENT_DT)) %>%
+  mutate(last = max(EVENT_DT)) %>%
+  mutate(time_diff = as.numeric(last-first)) %>%
+  filter(time_diff>90) %>% #Duration > 3 months
+  filter(EVENT_DT==min(EVENT_DT)) %>%
+  ungroup()%>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  rename(krt_date = EVENT_DT) %>%
+  select(ALF_PE, krt_date)
+
+incident_kf = decline_v2 %>%
+  left_join(kf_on_krt, by="ALF_PE") %>%
+  mutate(treated_kf_date = krt_date) %>%
+  filter(!is.na(krt_date)) %>%
+  bind_rows(incident_egfr15) %>%
+  group_by(ALF_PE) %>%
+  filter(krt_date ==min(krt_date)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  select(ALF_PE, krt_date, treated_kf_date)
+
+deaths = sqlQuery(channel, "SELECT alf_pe, death_dt 
+          FROM SAIL1214V.ADDE_DEATHS_20210128")%>% 
+  mutate(DEATH_DT = as.Date(DEATH_DT))
+
+cohort_v2 = decline_v2 %>%
+  left_join(incident_kf, by="ALF_PE") %>%
+  mutate(kf = ifelse(is.na(krt_date), 0, 1)) %>%
+  mutate(krt = ifelse(is.na(treated_kf_date), 0, 1)) %>%
+  left_join(deaths, by="ALF_PE") %>%
+  mutate(death = ifelse(is.na(DEATH_DT), 0, 1)) %>%
+  mutate(time2kf = ifelse(is.na(krt_date) & death==1, as.numeric(last-first),
+                   ifelse(is.na(krt_date) & death==0, time_diff,
+                   as.numeric(krt_date-first)))) %>%
+  mutate(time2krt = ifelse(is.na(treated_kf_date) & death==1, as.numeric(last-first),
+                   ifelse(is.na(treated_kf_date) & death==0, time_diff,
+                   as.numeric(treated_kf_date-first)))) %>%
+  group_by(ALF_PE) %>%
+  filter(EVENT_DT == min(EVENT_DT)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  filter(time2kf>0)
+
+#summarise eGFR before KRT
+cohort_v2 <- readRDS("S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/cohort_v2.rds")
+egfrs <- readRDS("S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/egfrs.rds")
+kf = cohort_v2 %>%
+  left_join(egfrs, by="ALF_PE") %>%
+  filter(EVENT_DT>"2012-12-31" & EVENT_DT<"2021-01-01" & EVENT_DT<krt_date) %>%
+  group_by(ALF_PE) %>%
+  filter(EVENT_DT==max(EVENT_DT)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T)
+kf_m = kf %>%
+  filter(sex.x=="Male")
+summary(kf_m$CKDEPI_eGFR.y)
+kf_f = kf %>%
+  filter(sex.x=="Female")
+summary(kf_f$CKDEPI_eGFR.y)
+```
+
+```{r Extract chronic conditions}
+cohort_v2_ids = cohort_v2 %>%
+  select(ALF_PE, first) %>%
+  rename(FIRST = first)
+
+sqlQuery(channel, "DROP TABLE SAILW1214V.DECLINE_IDS_V2")
+sqlQuery(channel, "CREATE TABLE SAILW1214V.DECLINE_IDS_V2 (
+            ALF_PE
+         FIRST;) ")
+vartypes = c(ALF_PE="Int", FIRST="Date")
+sqlSave(channel, dat = cohort_v2_ids, tablename = "SAILW1214V.DECLINE_IDS_V2", append = T, rownames = F, fast = T, varTypes=vartypes)
+sqlQuery(channel, "SELECT * FROM SAILW1214V.DECLINE_IDS_V2")
+
+get_any_previous_mm_count_readcode <- function(){
+  sqlQuery(channel,
+           "SELECT P.alf_pe, mmcode
+           FROM SAILW1214V.CKD_MM_COUNT_DIAGNOSIS_READ_CODES M, SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E,
+         SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P, SAILW1214V.DECLINE_IDS_V2 C
+         WHERE M.READCODE = E.EVENT_CD
+         AND P.ALF_PE = C.ALF_PE
+         AND E.PRAC_CD_PE = P.PRAC_CD_PE
+         AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+         AND E.EVENT_DT < C.FIRST")
+}
+read_code_defined_mm_count <- get_any_previous_mm_count_readcode()
+
+saveRDS (read_code_defined_mm_count, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/mm_count_diagnostic_read_codes_assigned_to_individuals_v2.rds")
+
+get_qualifying_drug <- function(){
+  sqlQuery(channel,
+           "SELECT C.alf_pe, drug_diagnosis_name
+         FROM SAILW1214V.MM_COUNT_DRUG_READ_CODES D, SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E, SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P, SAILW1214V.DECLINE_IDS_V2 C
+         WHERE D.READCODE = E.EVENT_CD 
+         AND E.PRAC_CD_PE = P.PRAC_CD_PE
+         AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+         AND P.ALF_PE = C.ALF_PE
+         AND YEAR(E.EVENT_DT) BETWEEN YEAR(C.FIRST) AND YEAR(C.FIRST+1)")
+}
+drug_qualifying_mm_diagnostic_code <- get_qualifying_drug()
+
+any <- drug_qualifying_mm_diagnostic_code%>%
+  group_by(DRUG_DIAGNOSIS_NAME)%>%
+  distinct(ALF_PE)%>%
+  ungroup()
+
+four_or_more <- drug_qualifying_mm_diagnostic_code%>%
+  group_by(DRUG_DIAGNOSIS_NAME, ALF_PE)%>%
+  count()%>%
+  filter(n>3)
+
+# apply qualifications #####
+
+mmcode_names <- read.csv ("S:/1214 - The Relationship Between Cancer and Kidney Disease/Bhautesh/Supporting/MM_code_names.csv")
+
+# "OR" qualifications - simply add to full list
+# these are depression, pain, anxiety, constipation, bipolar (lithium), migraine, ibs
+four_or_more$DRUG_DIAGNOSIS_NAME <- str_trim(four_or_more$DRUG_DIAGNOSIS_NAME)
+
+add_if_four_or_more <- four_or_more %>%
+  filter(DRUG_DIAGNOSIS_NAME=="antidepressant" | 
+           DRUG_DIAGNOSIS_NAME=="pain" | 
+           DRUG_DIAGNOSIS_NAME=="anxiety" |
+           DRUG_DIAGNOSIS_NAME=="constipation" |
+           DRUG_DIAGNOSIS_NAME=="migraine")%>%
+  distinct(ALF_PE, DRUG_DIAGNOSIS_NAME)%>%
+  mutate(MMCODE = ifelse(DRUG_DIAGNOSIS_NAME=="antidepressant", "3", 
+                         ifelse(DRUG_DIAGNOSIS_NAME=="pain", "4",
+                                ifelse(DRUG_DIAGNOSIS_NAME=="anxiety", "13",
+                                       ifelse(DRUG_DIAGNOSIS_NAME=="constipation", "18",
+                                              ifelse(DRUG_DIAGNOSIS_NAME=="migraine", "32",NA))))))
+
+add_if_four_or_more_2 <- four_or_more %>%
+  filter(DRUG_DIAGNOSIS_NAME=="ibs")%>%
+  distinct(ALF_PE)%>%
+  mutate(MMCODE = "14")
+
+any$DRUG_DIAGNOSIS_NAME <- str_trim(any$DRUG_DIAGNOSIS_NAME)
+
+add_if_any <- any%>%
+  filter(DRUG_DIAGNOSIS_NAME=="schiz")%>%
+  distinct(ALF_PE)%>%
+  mutate(MMCODE = "29")
+
+rm(any)
+rm(drug_qualifying_mm_diagnostic_code)
+# AND qualification - epilepsy, asthma,  psoriasis/eczema
+mmcount_full <- read_code_defined_mm_count
+rm(read_code_defined_mm_count)
+
+inhaler <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "asthma")%>%
+  distinct(ALF_PE)
+
+asthma_remove <- mmcount_full%>%
+  filter(MMCODE == "5")%>%
+  distinct(ALF_PE)%>%
+  anti_join(inhaler, by = "ALF_PE")
+
+antiepileptic <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "epilepsy")%>%
+  distinct(ALF_PE)
+
+epilepsy_remove <- mmcount_full%>%
+  filter(MMCODE == "27")%>%
+  distinct(ALF_PE)%>%
+  anti_join(antiepileptic, by = "ALF_PE")
+
+skin_tx <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "psorex")%>%
+  distinct(ALF_PE)
+
+psorex_remove <- mmcount_full%>%
+  filter(MMCODE == "30")%>%
+  distinct(ALF_PE)%>%
+  anti_join(skin_tx, by = "ALF_PE")
+
+# NOT qualifications - dyspepsia,
+
+ppi_etc <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "dyspepsia")%>%
+  distinct(ALF_PE)
+nsaid_and_antiplatelet <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "not_dyspepsia")%>%
+  distinct(ALF_PE)
+ALF_PE <- setdiff(ppi_etc$ALF_PE, nsaid_and_antiplatelet$ALF_PE)
+MMCODE <- "7"
+treated_dyspepsia <- data.frame(ALF_PE, MMCODE)
+
+rm(read_code_defined_mm_count)
+rm(four_or_more)
+
+mmcount_full <- merge(mmcount_full, subset(add_if_four_or_more, select = c(ALF_PE, MMCODE)), all = TRUE)
+
+mmcount_full <- merge(mmcount_full, subset(add_if_four_or_more_2, select = c(ALF_PE, MMCODE)), all = TRUE)
+
+mmcount_full <- merge(mmcount_full, treated_dyspepsia, all = TRUE)
+
+rm(drug_qualifying_mm_diagnostic_code)
+
+mmcount_full2 <- merge(mmcount_full, subset(add_if_any, select = c(ALF_PE, MMCODE)), all = TRUE)
+mmcount_full <- mmcount_full2
+rm(mmcount_full2)
+
+mmcount_full <- mmcount_full%>%
+  mutate(remove = (MMCODE=="5" & ALF_PE%in%asthma_remove$ALF_PE))%>%
+  mutate(remove2 = (MMCODE=="27" & ALF_PE%in%epilepsy_remove$ALF_PE))%>%
+  mutate(remove3 = (MMCODE=="30" & ALF_PE%in%psorex_remove$ALF_PE))%>%
+  filter(remove==FALSE & remove2==FALSE & remove3==FALSE)
+
+saveRDS(mmcount_full, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/mm_count_codes_and_participants_long_v2.rds")
+
+mmcount_wide <- cohort_v2 %>%
+  left_join(mmcount_full)%>%
+  left_join(mmcode_names%>%mutate(MMCODE = as.character(MMCode)))%>%
+  select(ALF_PE, Condition)%>%
+  group_by(Condition)%>%
+  distinct(ALF_PE)%>%
+  ungroup()%>%
+  mutate(dummy = 1)%>%
+  spread(Condition, dummy, fill = 0)
+summary(mmcount_wide)
+
+saveRDS(mmcount_wide, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/mmcount_wide_v2.rds")
+```
+
+```{r Extract Smoking}
+smoking = sqlQuery(channel, 
+                      "SELECT P.ALF_PE, EVENT_CD, EVENT_DT
+                      FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+                      LEFT JOIN SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P
+                      ON E.PRAC_CD_PE = P.PRAC_CD_PE
+                      AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+                      WHERE EVENT_CD IN ('1371.', '137L.',
+                                         '1377.', '1378.', '1379.', '137A', '137B.', '137F.', '137j.', '137K.',
+                                         '137l.', '137N.', '137O.', '137S.', '9km..',
+                                        '137..', '1372.', '1373.', '1374.', '1375.', '1376.', '137a.', '137H.',
+                                        '137J.', '137P.', '137Q.', '137Q.', '137R.', '137X.', '137Y.', '137Z.',
+                                        '9ko..')")
+smoking = smoking %>%
+  mutate(smoking_status = ifelse(EVENT_CD %in% c('1371.', '137L.'), "Non_smoker",
+                          ifelse(EVENT_CD %in% c('1377.', '1378.', '1379.', '137A.', '137B.', '137F.', '137j.', '137K.', '137l.', '137N.', '137O.', '137S.', '9km..'), "Ex-smoker",
+                          ifelse(EVENT_CD %in% c('137..', '1372.', '1373.', '1374.', '1375.', '1376.', '137a.', '137H.', '137J.', '137P.', '137Q.', '137R.', '137X.', '137Y.', '137Z.', '9ko..'), "Smoker", NA)))) %>%
+  mutate(smoking_status = as.factor(smoking_status)) %>%
+  rename(smoking_date = EVENT_DT)
+
+cohort_smoking = cohort %>%
+  left_join(smoking, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(smoking_date<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(smoking_date == max(smoking_date)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  select(ALF_PE, smoking_status) 
+
+cohort_v2_smoking = cohort_v2 %>%
+  left_join(smoking, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(smoking_date<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(smoking_date == max(smoking_date)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  select(ALF_PE, smoking_status)
+```
+
+```{r Extract Albuminuria}
+acr = sqlQuery(channel, 
+                      "SELECT P.ALF_PE, EVENT_CD, EVENT_DT as acr_date, EVENT_VAL as acr
+                      FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+                      LEFT JOIN SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P
+                      ON E.PRAC_CD_PE = P.PRAC_CD_PE
+                      AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+                      WHERE EVENT_CD IN ('46TC.', '44J7.')
+                ORDER BY ALF_PE;")
+acr = acr %>% 
+  filter(is.na(ACR) | ACR>0) %>%
+  mutate(ACR = ifelse(is.na(ACR), 0, ACR))
+
+cohort_acr = cohort %>%
+  left_join(acr, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(ACR_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(ACR_DATE == max(ACR_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  select(ALF_PE, ACR) 
+
+cohort_v2_acr = cohort_v2 %>%
+  left_join(acr, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(ACR_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(ACR_DATE == max(ACR_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  select(ALF_PE, ACR)
+```
+
+```{r Extract HBA1c}
+a1c = sqlQuery(channel, 
+                      "SELECT P.ALF_PE, EVENT_CD, EVENT_DT as a1c_date, EVENT_VAL as a1c
+                      FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+                      LEFT JOIN SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P
+                      ON E.PRAC_CD_PE = P.PRAC_CD_PE
+                      AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+                      WHERE EVENT_CD IN ('42c..', '42c3.', '42W..', '42c%.', '42w4.', '42w5.', '42wz.', '44TB.', '44tc.', '44tl.')
+                ORDER BY ALF_PE;")
+hba1c = a1c %>% 
+  filter(A1C_DATE>"2012-01-01" & !is.na(A1C) & A1C>20 & A1C<200)
+
+cohort_a1c = cohort_v2 %>%
+  filter(Diabetes==1) %>%
+  left_join(hba1c, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(A1C_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(A1C_DATE == max(A1C_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  dplyr::select(ALF_PE, sex, A1C) #Available for  patients
+
+cohort_a1c %>% 
+  summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "A1C"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "median",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+```
+
+```{r Extract systolic blood pressure}
+sbp = sqlQuery(channel, 
+                      "SELECT P.ALF_PE, EVENT_CD, EVENT_DT as sbp_date, EVENT_VAL as sbp
+                      FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+                      LEFT JOIN SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P
+                      ON E.PRAC_CD_PE = P.PRAC_CD_PE
+                      AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+                      WHERE EVENT_CD IN ('2469.', '246N.', '246Q.', '246S.', '246b.', '246d.', '246e.', '246W.', '246Y.', '246l.', '246..')
+                ORDER BY ALF_PE;")
+
+systolic_bp = sbp %>% 
+  mutate(SBP = ifelse(SBP>1000000, SBP/100000, SBP)) %>%
+  filter(between(SBP, 60, 300))
+
+cohort_sbp = cohort_v2 %>%
+  left_join(systolic_bp, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(SBP_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(SBP_DATE == max(SBP_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  dplyr::select(ALF_PE, sex, SBP) 
+summary(cohort_sbp)
+cohort_sbp %>% 
+  summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "SBP"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "mean",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+```
+
+```{r Extract BMI}
+bmi = sqlQuery(channel, 
+                      "SELECT P.ALF_PE, EVENT_CD, EVENT_DT as bmi_date, EVENT_VAL as bmi
+                      FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+                      LEFT JOIN SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P
+                      ON E.PRAC_CD_PE = P.PRAC_CD_PE
+                      AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+                      WHERE EVENT_CD IN ('22K..')
+                ORDER BY ALF_PE;")
+BMI = bmi %>% 
+  filter(between(BMI, 10, 60)) %>%
+  filter(BMI_DATE>"2009-01-01" & BMI_DATE<"2020-10-01" & !is.na(ALF_PE)) %>%
+  select(ALF_PE, BMI_DATE, BMI)
+
+cohort_bmi = cohort_v2 %>%
+  left_join(BMI, by="ALF_PE") %>%
+  mutate(plus_twelve_months = first + 366) %>%
+  filter(BMI_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(BMI_DATE == max(BMI_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  dplyr::select(ALF_PE, sex, BMI)
+hist(cohort_bmi$BMI)
+cohort_bmi %>% 
+  summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "BMI"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "mean",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+
+compare_bmi = compare %>%
+  left_join(BMI, by="ALF_PE") %>%
+  mutate(plus_twelve_months = EVENT_DT + 366) %>%
+  filter(BMI_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(BMI_DATE == max(BMI_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  dplyr::select(ALF_PE, status, BMI)
+
+cb = as.data.frame(compare_bmi %>% 
+  summary_factorlist(dependent = "status",
+                     explanatory = c(
+                       "BMI"
+                       ),
+                       p=F,
+                       column=T,
+                       total_col=T,
+                     cont = "mean",
+                     cont_range=T,
+                       na_include=F
+                     ))
+```
+
+```{r Extract medications}
+#RAS-inhibitors
+get_drugs <- function(){
+  sqlQuery(channel,
+           "SELECT E.ALF_PE, EVENT_CD, E.EVENT_DT
+         FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+         LEFT JOIN SAILW1214V.DECLINE_IDS_V2 C
+        ON E.ALF_PE = C.ALF_PE
+         WHERE E.EVENT_DT<C.FIRST
+         AND (event_cd LIKE 'bk%' OR event_cd LIKE 'bi%')")
+}
+drugs <- get_drugs()
+
+ras_i = drugs %>%
+  group_by(ALF_PE) %>%
+  filter(EVENT_DT == max(EVENT_DT)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T)
+
+cohort_rasi = cohort_v2 %>%
+  left_join(ras_i, by="ALF_PE") %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  mutate(ras_i = as.factor(ifelse(is.na(EVENT_CD), "No", "Yes"))) %>%
+  dplyr::select(ALF_PE, sex, ras_i)
+cohort_rasi %>% 
+  summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "ras_i"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "mean",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+
+#Statins
+get_statins <- function(){
+  sqlQuery(channel,
+           "SELECT E.ALF_PE, EVENT_CD, E.EVENT_DT
+         FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+         LEFT JOIN SAILW1214V.DECLINE_IDS_V2 C
+        ON E.ALF_PE = C.ALF_PE
+         WHERE E.EVENT_DT<C.FIRST
+         AND event_cd LIKE 'bx%'")
+}
+statins <- get_statins()
+
+statins = statins %>%
+  group_by(ALF_PE) %>%
+  filter(EVENT_DT == max(EVENT_DT)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T)
+
+cohort_statins = cohort_v2 %>%
+  left_join(statins, by="ALF_PE") %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  mutate(statins = as.factor(ifelse(is.na(EVENT_CD), "No", "Yes"))) %>%
+  dplyr::select(ALF_PE, sex, statins)
+
+cohort_statins %>% 
+  summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "statins"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "mean",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+
+#Metformin 
+get_metformin <- function(){
+  sqlQuery(channel,
+           "SELECT E.ALF_PE, EVENT_CD, E.EVENT_DT
+         FROM SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E
+         LEFT JOIN SAILW1214V.DECLINE_IDS_V2 C
+        ON E.ALF_PE = C.ALF_PE
+         WHERE E.EVENT_DT<C.FIRST
+         AND event_cd LIKE 'f41%'")
+}
+metformin <- get_metformin()
+
+metformin = metformin %>%
+  group_by(ALF_PE) %>%
+  filter(EVENT_DT == max(EVENT_DT)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T)
+
+cohort_metformin = cohort_v2 %>%
+  left_join(metformin, by="ALF_PE") %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  mutate(metformin = as.factor(ifelse(is.na(EVENT_CD), "No", "Yes"))) %>%
+  dplyr::select(ALF_PE, sex, metformin)
+
+cohort_metformin %>% 
+  summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "metformin"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "mean",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+```
+
+```{r Extract Deprivation}
+wimd_2011 <-sqlQuery(channel, "SELECT alf_pe, WIMD_2011_QUINTILE, WIMD_2011_QUINTILE_DESC
+          FROM SAIL1214V.WDSD_CLEAN_ADD_GEOG_CHAR_LSOA2001_20210221") %>%
+  distinct(ALF_PE, .keep_all = T)
+
+wimd = cohort %>%
+  left_join(wimd_2011, by="ALF_PE") %>%
+  select(ALF_PE, WIMD_2011_QUINTILE, WIMD_2011_QUINTILE_DESC)
+
+wimd_v2 = cohort_v2 %>%
+  left_join(wimd_2011, by="ALF_PE") %>%
+  select(ALF_PE, WIMD_2011_QUINTILE, WIMD_2011_QUINTILE_DESC)
+```
+
+```{r Compare baseline data for those with and without enough eGFR values}
+overall = egfrs %>%
+  filter(EVENT_DT>"2012-12-31" & EVENT_DT<"2021-01-01" & age>17) %>% 
+  group_by(ALF_PE) %>%
+  mutate(FIRST = min(EVENT_DT)) %>%
+  filter(EVENT_DT == min(EVENT_DT)) %>%
+  ungroup() %>%
+  mutate(sex = as.factor(ifelse(sex==1, "Male", "Female"))) %>%
+  distinct(ALF_PE, .keep_all = T)
+
+overall_ids = overall %>%
+  dplyr::select(ALF_PE, FIRST)
+
+sqlQuery(channel, "DROP TABLE SAILW1214V.OVERALL_DECLINE_IDS_V2")
+sqlQuery(channel, "CREATE TABLE SAILW1214V.OVERALL_DECLINE_IDS_V2 (
+            ALF_PE
+         FIRST;) ")
+vartypes = c(ALF_PE="Int", FIRST="Date")
+sqlSave(channel, dat = overall_ids, tablename = "SAILW1214V.OVERALL_DECLINE_IDS_V2", append = T, rownames = F, fast = T, varTypes=vartypes)
+sqlQuery(channel, "SELECT * FROM SAILW1214V.OVERALL_DECLINE_IDS_V2")
+
+get_any_previous_mm_count_readcode <- function(){
+  sqlQuery(channel,
+           "SELECT P.alf_pe, mmcode
+           FROM SAILW1214V.CKD_MM_COUNT_DIAGNOSIS_READ_CODES M, SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E,
+         SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P, SAILW1214V.OVERALL_DECLINE_IDS_V2 C
+         WHERE M.READCODE = E.EVENT_CD
+         AND P.ALF_PE = C.ALF_PE
+         AND E.PRAC_CD_PE = P.PRAC_CD_PE
+         AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+         AND E.EVENT_DT < C.FIRST")
+}
+read_code_defined_mm_count <- get_any_previous_mm_count_readcode()
+
+saveRDS (read_code_defined_mm_count, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/mm_count_diagnostic_read_codes_assigned_to_individuals_v3.rds")
+
+get_qualifying_drug <- function(){
+  sqlQuery(channel,
+           "SELECT C.alf_pe, drug_diagnosis_name
+         FROM SAILW1214V.MM_COUNT_DRUG_READ_CODES D, SAIL1214V.WLGP_GP_EVENT_CLEANSED_20201001 E, SAIL1214V.WLGP_PATIENT_ALF_CLEANSED_20201001 P, SAILW1214V.OVERALL_DECLINE_IDS_V2 C
+         WHERE D.READCODE = E.EVENT_CD 
+         AND E.PRAC_CD_PE = P.PRAC_CD_PE
+         AND E.LOCAL_NUM_PE = P.LOCAL_NUM_PE
+         AND P.ALF_PE = C.ALF_PE
+         AND YEAR(E.EVENT_DT) BETWEEN YEAR(C.FIRST) AND YEAR(C.FIRST+1)")
+}
+drug_qualifying_mm_diagnostic_code <- get_qualifying_drug()
+
+any <- drug_qualifying_mm_diagnostic_code%>%
+  group_by(DRUG_DIAGNOSIS_NAME)%>%
+  distinct(ALF_PE)%>%
+  ungroup()
+
+four_or_more <- drug_qualifying_mm_diagnostic_code%>%
+  group_by(DRUG_DIAGNOSIS_NAME, ALF_PE)%>%
+  count()%>%
+  filter(n>3)
+
+# apply qualifications #####
+
+mmcode_names <- read.csv ("S:/1214 - The Relationship Between Cancer and Kidney Disease/Bhautesh/Supporting/MM_code_names.csv")
+
+# "OR" qualifications - simply add to full list
+# these are depression, pain, anxiety, constipation, bipolar (lithium), migraine, ibs
+four_or_more$DRUG_DIAGNOSIS_NAME <- str_trim(four_or_more$DRUG_DIAGNOSIS_NAME)
+
+add_if_four_or_more <- four_or_more %>%
+  filter(DRUG_DIAGNOSIS_NAME=="antidepressant" | 
+           DRUG_DIAGNOSIS_NAME=="pain" | 
+           DRUG_DIAGNOSIS_NAME=="anxiety" |
+           DRUG_DIAGNOSIS_NAME=="constipation" |
+           DRUG_DIAGNOSIS_NAME=="migraine")%>%
+  distinct(ALF_PE, DRUG_DIAGNOSIS_NAME)%>%
+  mutate(MMCODE = ifelse(DRUG_DIAGNOSIS_NAME=="antidepressant", "3", 
+                         ifelse(DRUG_DIAGNOSIS_NAME=="pain", "4",
+                                ifelse(DRUG_DIAGNOSIS_NAME=="anxiety", "13",
+                                       ifelse(DRUG_DIAGNOSIS_NAME=="constipation", "18",
+                                              ifelse(DRUG_DIAGNOSIS_NAME=="migraine", "32",NA))))))
+
+add_if_four_or_more_2 <- four_or_more %>%
+  filter(DRUG_DIAGNOSIS_NAME=="ibs")%>%
+  distinct(ALF_PE)%>%
+  mutate(MMCODE = "14")
+
+any$DRUG_DIAGNOSIS_NAME <- str_trim(any$DRUG_DIAGNOSIS_NAME)
+
+add_if_any <- any%>%
+  filter(DRUG_DIAGNOSIS_NAME=="schiz")%>%
+  distinct(ALF_PE)%>%
+  mutate(MMCODE = "29")
+
+rm(any)
+rm(drug_qualifying_mm_diagnostic_code)
+# AND qualification - epilepsy, asthma,  psoriasis/eczema
+mmcount_full <- read_code_defined_mm_count
+rm(read_code_defined_mm_count)
+
+inhaler <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "asthma")%>%
+  distinct(ALF_PE)
+
+asthma_remove <- mmcount_full%>%
+  filter(MMCODE == "5")%>%
+  distinct(ALF_PE)%>%
+  anti_join(inhaler, by = "ALF_PE")
+
+antiepileptic <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "epilepsy")%>%
+  distinct(ALF_PE)
+
+epilepsy_remove <- mmcount_full%>%
+  filter(MMCODE == "27")%>%
+  distinct(ALF_PE)%>%
+  anti_join(antiepileptic, by = "ALF_PE")
+
+skin_tx <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "psorex")%>%
+  distinct(ALF_PE)
+
+psorex_remove <- mmcount_full%>%
+  filter(MMCODE == "30")%>%
+  distinct(ALF_PE)%>%
+  anti_join(skin_tx, by = "ALF_PE")
+
+# NOT qualifications - dyspepsia,
+
+ppi_etc <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "dyspepsia")%>%
+  distinct(ALF_PE)
+nsaid_and_antiplatelet <- four_or_more%>%
+  filter(DRUG_DIAGNOSIS_NAME == "not_dyspepsia")%>%
+  distinct(ALF_PE)
+ALF_PE <- setdiff(ppi_etc$ALF_PE, nsaid_and_antiplatelet$ALF_PE)
+MMCODE <- "7"
+treated_dyspepsia <- data.frame(ALF_PE, MMCODE)
+
+rm(read_code_defined_mm_count)
+rm(four_or_more)
+
+mmcount_full <- merge(mmcount_full, subset(add_if_four_or_more, select = c(ALF_PE, MMCODE)), all = TRUE)
+
+mmcount_full <- merge(mmcount_full, subset(add_if_four_or_more_2, select = c(ALF_PE, MMCODE)), all = TRUE)
+
+mmcount_full <- merge(mmcount_full, treated_dyspepsia, all = TRUE)
+
+rm(drug_qualifying_mm_diagnostic_code)
+
+mmcount_full2 <- merge(mmcount_full, subset(add_if_any, select = c(ALF_PE, MMCODE)), all = TRUE)
+mmcount_full <- mmcount_full2
+rm(mmcount_full2)
+
+mmcount_full <- mmcount_full%>%
+  mutate(remove = (MMCODE=="5" & ALF_PE%in%asthma_remove$ALF_PE))%>%
+  mutate(remove2 = (MMCODE=="27" & ALF_PE%in%epilepsy_remove$ALF_PE))%>%
+  mutate(remove3 = (MMCODE=="30" & ALF_PE%in%psorex_remove$ALF_PE))%>%
+  filter(remove==FALSE & remove2==FALSE & remove3==FALSE)
+
+mmcount_wide <- overall %>%
+  left_join(mmcount_full)%>%
+  left_join(mmcode_names%>%mutate(MMCODE = as.character(MMCode)))%>%
+  dplyr::select(ALF_PE, Condition)%>%
+  group_by(Condition)%>%
+  distinct(ALF_PE)%>%
+  ungroup()%>%
+  mutate(dummy = 1)%>%
+  spread(Condition, dummy, fill = 0)
+
+compare = mmcount_wide %>%
+  left_join(cohort_v2) %>%
+  mutate(status = as.factor(ifelse(is.na(include), "not_included", "included"))) %>%
+  left_join(egfrs) %>%
+  group_by(ALF_PE) %>%
+  filter(EVENT_DT == min(EVENT_DT)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T)
+
+wimd_2011 <-sqlQuery(channel, "SELECT alf_pe, WIMD_2011_QUINTILE, WIMD_2011_QUINTILE_DESC
+          FROM SAIL1214V.WDSD_CLEAN_ADD_GEOG_CHAR_LSOA2001_20210221") %>%
+  distinct(ALF_PE, .keep_all = T)
+
+wimd = compare %>%
+  left_join(wimd_2011, by="ALF_PE") %>%
+  dplyr::select(ALF_PE, WIMD_2011_QUINTILE, WIMD_2011_QUINTILE_DESC)
+
+compare_smoking = compare %>%
+  left_join(smoking, by="ALF_PE") %>%
+  mutate(plus_twelve_months = EVENT_DT + 366) %>%
+  filter(smoking_date<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(smoking_date == max(smoking_date)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  dplyr::select(ALF_PE, smoking_status)
+
+compare_sbp = compare %>%
+  left_join(systolic_bp, by="ALF_PE") %>%
+  mutate(plus_twelve_months = EVENT_DT + 366) %>%
+  filter(SBP_DATE<plus_twelve_months) %>%
+  group_by(ALF_PE) %>%
+  filter(SBP_DATE == max(SBP_DATE)) %>%
+  ungroup() %>%
+  distinct(ALF_PE, .keep_all = T) %>%
+  dplyr::select(ALF_PE, sex, SBP)
+
+compare = list(compare, compare_smoking, compare_sbp, wimd) %>%
+  reduce(left_join, by="ALF_PE") %>%
+  dplyr::select(-c(ethnic, EVENT_DT, CREAT, sCr, `<NA>`)) %>%
+  mutate(smoking_status = smoking_status %>%
+           fct_relevel("Non_smoker", "Ex-smoker", "Smoker")) %>%
+  mutate(WIMD_2011_QUINTILE_DESC = as.factor(WIMD_2011_QUINTILE_DESC)) %>%
+  mutate(Diabetes = as.factor(Diabetes)) %>%
+  mutate(Heart_failure = as.factor(Heart_failure)) %>%
+  mutate(Hypertension = as.factor(Hypertension))
+
+compare %>% 
+  mutate(sex = as.factor(sex.x)) %>%
+  mutate(CHD = as.factor(`Coronary Heart disease`)) %>%
+  finalfit::summary_factorlist(dependent = "status",
+                     explanatory = c(
+                       "sex",
+                       "age", 
+                       "WIMD_2011_QUINTILE_DESC",
+                       "CKDEPI_eGFR", 
+                       "SBP",
+                       "smoking_status", 
+                       "Diabetes", 
+                       "Heart_failure", 
+                       "Hypertension",
+                       "Peripheral_vascular_disease",
+                       "Atrial_fibrillation",
+                       "Stroke_or_TIA",
+                       "CHD"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "median",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+```
+
+```{r Combine baseline variables}
+cohort_v2 = list(cohort_v2, cohort_v2_smoking, cohort_v2_acr, mmcount_wide_v2, wimd_v2) %>%
+  reduce(left_join, by="ALF_PE") %>%
+  select(-c(ethnic, EVENT_DT, CREAT, sCr, `<NA>`)) %>%
+  filter(is.na(DEATH_DT) | DEATH_DT>last) %>%
+  mutate(smoking_status = smoking_status %>%
+           fct_relevel("Non_smoker", "Ex-smoker", "Smoker")) %>%
+  mutate(CM_conditions = Hypertension+`Coronary Heart disease`+Peripheral_vascular_disease+Atrial_fibrillation+Diabetes+Heart_failure+Stroke_or_TIA) %>%
+  mutate(conditions = Alcohol_problem+
+           Anorexia_or_bulimia+
+           Anxiety+
+           Asthma+
+           Atrial_fibrillation+
+           Bronchiectasis+
+           Cancer+
+           Chronic_liver_disease+
+           Chronic_sinusitis+
+           COPD+
+           `Coronary Heart disease`+
+           Dementia+
+           Depression+
+           Diabetes+
+           Diverticular_disease+
+          `Epilepsy_(Currently_treated)`+
+           Glaucoma+
+           Heart_failure+
+           Hypertension+
+           Inflammatory_bowel_disease+
+           Irritable_bowel_syndrome+
+           Migraine+
+           Multiple_sclerosis+
+           Other_psychoactive_substance_misuse+
+           Painful_condition+
+           `Parkinson's_disease`+
+           Peripheral_vascular_disease+
+           Prostate_disorders+
+           Psoriasis_or_eczema+
+           Rheumatoid_arthritis_Inflammatory_arthropathies_and_connective_tissue_disorders+
+           Schizophrenia_or_bipolar_disorder+
+           Stroke_or_TIA+
+           Thyroid_disease+
+           Treated_constipation+
+           Treated_dyspepsia+
+           Viral_hepatitis) %>%
+  mutate(Diabetes = as.factor(Diabetes)) %>%
+  mutate(Heart_failure = as.factor(Heart_failure)) %>%
+  mutate(Hypertension = as.factor(Hypertension)) %>%
+  mutate(WIMD_2011_QUINTILE_DESC = as.factor(WIMD_2011_QUINTILE_DESC)) %>%
+  mutate(egfr10 = new_eGFR/10) %>%
+  mutate(ACR10 = ACR/10) %>%
+  filter(age<111)
+
+cohort_v2 %>% 
+  mutate(CHD = as.factor(`Coronary Heart disease`)) %>%
+  finalfit::summary_factorlist(dependent = "sex",
+                     explanatory = c(
+                       "age", 
+                       "CKDEPI_eGFR", 
+                       "ACR",
+                       "smoking_status", 
+                       "WIMD_2011_QUINTILE_DESC", 
+                       "Diabetes", 
+                       "Heart_failure", 
+                       "Hypertension",
+                       "Peripheral_vascular_disease",
+                       "Atrial_fibrillation",
+                       "Stroke_or_TIA",
+                       "CHD"
+                       ),
+                       p=T,
+                       column=T,
+                       total_col=T,
+                     cont = "median",
+                     cont_range=T,
+                       na_include=F
+                     ) %>% 
+  knitr::kable()
+summary(cohort_v2$sex) 
+summary(cohort_v2$time2kf)
+summary(cohort_v2$WIMD_2011_QUINTILE)
+summary(cohort_v2$ACR)
+```
+
+```{r Survival analysis: Kidney failure events}
+cohort_v2 <- readRDS("S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Data/cohort_v2.rds") %>%
+  mutate(age10 = age/10) %>%
+  mutate(last_date = as.Date("2020-10-01")) %>%
+  mutate(time2death = as.numeric(ifelse(!is.na(DEATH_DT), DEATH_DT-first,
+                                        last_date-first))) %>%
+  mutate(CHD = as.factor(`Coronary Heart disease`)) %>%
+  mutate(Atrial_fibrillation = as.factor(Atrial_fibrillation)) %>%
+  mutate(Peripheral_vascular_disease = as.factor(Peripheral_vascular_disease)) %>%
+  mutate(Stroke_or_TIA = as.factor(Stroke_or_TIA)) %>%
+  mutate(cvd = as.factor(ifelse(CHD==1, 1,
+               ifelse(Atrial_fibrillation==1, 1,
+               ifelse(Peripheral_vascular_disease==1, 1,
+               ifelse(Stroke_or_TIA==1, 1,
+               ifelse(Heart_failure==1, 1, 0))))))) %>%
+  mutate(time_krt_to_death = as.numeric(DEATH_DT-krt_date)) %>%
+  mutate(ckd5 = ifelse(kf==1 & krt==0, 1, 0))
+summary(cohort_v2$time2death)
+summary(as.factor(cohort_v2$kf))
+summary(as.factor(cohort_v2$death))
+summary(cohort_v2$time_diff)
+density_time = density(cohort_v2$time_diff)
+plot(density_time)
+
+##Calculate event rates
+#Kidney failure
+fit1 = pyears(Surv(time2kf/365.25, kf)~sex, scale=1000, data = cohort_v2)
+fit1$event/fit1$pyears
+#All-cause mortality
+fit2 = pyears(Surv(time2death/365.25, death)~sex, scale=1000, data = cohort_v2)
+fit2$event/fit2$pyears
+#ACM for those with KFRT
+krt = cohort_v2 %>%
+  filter(krt==1)
+fit3 = pyears(Surv(time_krt_to_death/365.25, death)~sex, scale=1000, data = krt)
+fit3$event/fit3$pyears
+#ACM for those with sustained eGFR<15
+kf = cohort_v2 %>% 
+  filter(!is.na(krt_date) & is.na(treated_kf_date) & kf==1)
+fit4 = pyears(Surv(time_krt_to_death/365.25, death)~sex, scale=1000, data = kf)
+fit4$event/fit4$pyears
+#KRT
+fit5 = pyears(Surv(time2krt/365.25, krt)~sex, scale=1000, data = cohort_v2)
+fit5$event/fit5$pyears
+#CKD5 not requiring KRT
+fit6 = pyears(Surv(time2krt/365.25, ckd5)~sex, scale=1000, data = cohort_v2)
+fit6$event/fit6$pyears
+
+cohort_v2_f = cohort_v2 %>%
+  filter(sex=="Female")
+summary(as.factor(cohort_v2_f$kf))
+summary(as.factor(cohort_v2_f$death))
+
+cohort_v2_m = cohort_v2 %>%
+  filter(sex=="Male")
+summary(as.factor(cohort_v2_m$kf))
+summary(as.factor(cohort_v2_m$death))
+
+cohort_v2_kf = cohort_v2 %>%
+  filter(kf==1)
+summary(as.factor(cohort_v2_kf$death))
+
+survival_object = Surv(cohort_v2$time2kf/365.25, cohort_v2$kf)
+my_survfit = survfit(survival_object~sex, data=cohort_v2)
+ggsurvplot(my_survfit, fun="event",
+           risk.table = T, fontsize=3, tables.text.y=F, tables.theme = theme_cleantable(),
+           censor=F, censor.size=2, 
+           ggtheme = theme_classic(), 
+           legend.title="Sex",
+           legend.labs=c("Female", "Male"),
+           xlim=c(0,7), conf.int=T, ylim=c(0,0.01), break.time.by=1,
+           xlab="Time (years)", ylab="Proportion with kidney failure",)
+
+##Univariable model
+dependent = "Surv(time2kf, kf)"
+explanatory = "sex"
+uni_model = cohort_v2 %>%
+  finalfit(dependent, explanatory)
+
+##Multivariable model
+explanatory = c("sex", "age10", "egfr10", "Diabetes", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+multi_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+#Check for collinearity
+m_model = coxph(Surv(time2kf, kf)~sex+age10+egfr10+Diabetes+smoking_status+WIMD_2011_QUINTILE_DESC+Hypertension+Heart_failure+Atrial_fibrillation+Peripheral_vascular_disease+Stroke_or_TIA+CHD, data=cohort_v2)
+collinear = check_collinearity(m_model)
+
+##Interaction models
+explanatory = c("sex*age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_age_model = cohort_v2%>%
+  finalfit(dependent, explanatory) 
+
+explanatory = c("sex*Diabetes", "age10", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_diabetes_model = cohort_v2%>%
+  finalfit(dependent, explanatory) 
+
+explanatory = c("sex*egfr10", "age10", "Diabetes", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_egfr_model = cohort_v2%>%
+  finalfit(dependent, explanatory) 
+
+explanatory = c("sex*smoking_status", "age10", "Diabetes", "egfr10", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_smoking_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*WIMD_2011_QUINTILE_DESC", "age10", "Diabetes", "egfr10", "smoking_status", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_dep_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*Hypertension", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_htn_model = cohort_v2%>%
+  finalfit(dependent, explanatory) 
+
+explanatory = c("sex*Heart_failure", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_hf_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*Atrial_fibrillation", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+int_af_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*Peripheral_vascular_disease", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Stroke_or_TIA", "CHD")
+int_pvd_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*Stroke_or_TIA", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "CHD")
+int_stroke_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*CHD", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA")
+int_chd_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+#Calculate sex-stratified HRs for age
+age_int = coxph(Surv(time2kf, kf)~sex*age10+egfr10+Diabetes+smoking_status+WIMD_2011_QUINTILE_DESC+Hypertension+Heart_failure+Atrial_fibrillation+Peripheral_vascular_disease+Stroke_or_TIA+CHD , cohort_v2)
+
+age_f = glht(age_int, linfct = c("age10=0"))
+confint(age_f)
+
+age_m = glht(age_int, linfct = c("age10+sexMale:age10=0"))
+confint(age_m)
+
+#Calculate sex-stratified HRs for eGFR
+egfr_int = coxph(Surv(time2kf, kf)~sex*egfr10+age10+Diabetes+smoking_status+WIMD_2011_QUINTILE_DESC+Hypertension+Heart_failure+Atrial_fibrillation+Peripheral_vascular_disease+Stroke_or_TIA+CHD , cohort_v2)
+
+egfr_f = glht(egfr_int, linfct = c("egfr10=0"))
+confint(egfr_f)
+
+egfr_m = glht(egfr_int, linfct = c("egfr10+sexMale:egfr10=0"))
+confint(egfr_m)
+
+#Fine-Gray model
+cohort_v2 = cohort_v2 %>%
+  mutate(status = ifelse(is.na(DEATH_DT) & kf==0, 0, #No event
+                  ifelse(kf==1, 1, #Kidney failure
+                         2))) %>% #Died before kf
+  mutate(time = ifelse(status==0, time2death,
+                ifelse(status==1, time2kf, time2death)))
+cohort_v2_complete = cohort_v2 %>%
+  filter(!is.na(smoking_status) & !is.na(WIMD_2011_QUINTILE))
+
+dependent_crr = "Surv(time, status)"
+dependent = "Surv(time2kf, kf)"
+explanatory = c("sex", "age10", "egfr10", "Diabetes", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "Heart_failure", "Atrial_fibrillation", "Peripheral_vascular_disease", "Stroke_or_TIA", "CHD")
+crr = cohort_v2_complete %>%
+  summary_factorlist(dependent, explanatory, fit_id = T) %>%
+  ff_merge(cohort_v2_complete %>%
+           crrmulti(dependent_crr, explanatory) %>%
+             fit2df())
+
+##Models stratified by sex
+explanatory = c("age10", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Diabetes", "Hypertension")
+
+#Women
+cohort_v2%>%
+  filter(sex=="Female") %>%
+  finalfit(dependent, explanatory)
+
+#Men
+cohort_v2%>%
+  filter(sex=="Male") %>%
+  finalfit(dependent, explanatory)
+
+##Interaction model all included
+dependent = "Surv(time2kf, kf)"
+explanatory = c("sex*age10", "sex*egfr10", "sex*Diabetes", "sex*smoking_status", "sex*WIMD_2011_QUINTILE_DESC", "sex*Hypertension", "sex*Heart_failure", "sex*Atrial_fibrillation", "sex*Peripheral_vascular_disease", "sex*Stroke_or_TIA", "sex*CHD")
+full_interact_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+#Sensitivity analysis - any cardiovascular condition
+##Multivariable model
+dependent = "Surv(time2kf, kf)"
+explanatory = c("sex", "age10", "egfr10", "Diabetes", "smoking_status", "WIMD_2011_QUINTILE_DESC", "cvd")
+multi_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+##Interaction models
+explanatory = c("sex*age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "cvd")
+int_age_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*Diabetes", "age10", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "cvd")
+int_diabetes_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*egfr10", "age10", "Diabetes", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension", "cvd")
+int_egfr_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*smoking_status", "age10", "Diabetes", "egfr10", "WIMD_2011_QUINTILE_DESC", "Hypertension", "cvd")
+int_smoking_model = cohort_v2%>%
+  finalfit(dependent, explanatory) 
+
+explanatory = c("sex*WIMD_2011_QUINTILE_DESC", "age10", "Diabetes", "egfr10", "smoking_status", "Hypertension", "cvd")
+int_dep_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+
+explanatory = c("sex*Hypertension", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "cvd")
+int_htn_model = cohort_v2%>%
+  finalfit(dependent, explanatory) 
+
+explanatory = c("sex*cvd", "age10", "Diabetes", "egfr10", "smoking_status", "WIMD_2011_QUINTILE_DESC", "Hypertension")
+int_cvd_model = cohort_v2%>%
+  finalfit(dependent, explanatory)
+```
+
+```{r Plots of eGFRs using age}
+change_over_age = long_cohort_v3 %>% 
+  filter(between(age, 18, 110)) %>%
+  select(ALF_PE, age, sex, CKDEPI_eGFR)
+
+plot3 = ggplot(change_over_age, aes(x=age, y=CKDEPI_eGFR, colour=sex))+
+  ylab("eGFR")+
+  geom_smooth(method = "locfit", se=T, method.args=list(deg=1, alpha=0.3))+
+  labs(title = "",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)))+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  scale_colour_manual(labels = c("Females", "Males"),
+                      values = c("firebrick1", "dodgerblue"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+```
+
+```{r eGFR decline sex - models and plots}
+wts_f_2 = long_cohort_v3 %>%
+  filter(!is.na(smoking_status) & !is.na(WIMD_2011_QUINTILE)) %>%
+  mutate(age.1 = ifelse(age<72.6, 0, age-72.6)) %>%
+  filter(sex=="Female") %>%
+  mutate(WIMD_2011_QUINTILE = as.factor(WIMD_2011_QUINTILE)) %>%
+  mutate(Peripheral_vascular_disease = as.factor(Peripheral_vascular_disease)) %>%
+  mutate(Atrial_fibrillation = as.factor(Atrial_fibrillation)) %>%
+  mutate(`Coronary Heart disease` = as.factor(`Coronary Heart disease`)) %>%
+  mutate(Stroke_or_TIA = as.factor(Stroke_or_TIA))
+lme1_f_2 <- lmer(CKDEPI_eGFR ~ age + I(ifelse(age<72.6, 0, age-72.6)) + (1 | ALF_PE) + Diabetes + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+
+wts_m_2 = long_cohort_v3 %>%
+  filter(!is.na(smoking_status) & !is.na(WIMD_2011_QUINTILE)) %>%
+  mutate(age.1 = ifelse(age<73.8, 0, age-73.8)) %>%
+  filter(sex=="Male") %>%
+  mutate(WIMD_2011_QUINTILE = as.factor(WIMD_2011_QUINTILE)) %>%
+  mutate(Peripheral_vascular_disease = as.factor(Peripheral_vascular_disease)) %>%
+  mutate(Atrial_fibrillation = as.factor(Atrial_fibrillation)) %>%
+  mutate(`Coronary Heart disease` = as.factor(`Coronary Heart disease`)) %>%
+  mutate(Stroke_or_TIA = as.factor(Stroke_or_TIA))
+lme1_m_2 <- lmer(CKDEPI_eGFR ~ age + I(ifelse(age<73.8, 0, age-73.8)) + (1 | ALF_PE) + Diabetes + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+
+##Diabetes interaction
+#Female - diabetes
+lme1_f_diabetes <- lmer(CKDEPI_eGFR ~ age*Diabetes + I(ifelse(age<72.6, 0, age-72.6))*Diabetes + (1 | ALF_PE) + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_diabetes_coefs = broom.mixed::tidy(lme1_f_diabetes, conf.int=T)
+#Add coefficients
+dm_before_f = glht(lme1_f_diabetes, linfct = c("age+age:Diabetes1=0"))
+confint(dm_before_f)
+dm_after_f = glht(lme1_f_diabetes, linfct = c("age+age:Diabetes1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Diabetes1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dm_after_f)
+no_dm_before_f = glht(lme1_f_diabetes, linfct = c("age=0"))
+confint(no_dm_before_f)
+no_dm_after_f = glht(lme1_f_diabetes, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_dm_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_diabetes)
+
+#Male - diabetes
+lme1_m_diabetes <- lmer(CKDEPI_eGFR ~ age*Diabetes + I(ifelse(age<73.8, 0, age-73.8))*Diabetes + (1 | ALF_PE) + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_diabetes_coefs = broom.mixed::tidy(lme1_m_diabetes, conf.int=T)
+#Add coefficients
+dm_before_m = glht(lme1_m_diabetes, linfct = c("age+age:Diabetes1=0"))
+confint(dm_before_m)
+dm_after_m = glht(lme1_m_diabetes, linfct = c("age+age:Diabetes1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Diabetes1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dm_after_m)
+no_dm_before_m = glht(lme1_m_diabetes, linfct = c("age=0"))
+confint(no_dm_before_m)
+no_dm_after_m = glht(lme1_m_diabetes, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_dm_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_diabetes)
+
+#Plot
+pred_f_diabetes = ggpredict(lme1_f_diabetes, c("age", "Diabetes"))
+pred_m_diabetes = ggpredict(lme1_m_diabetes, c("age", "Diabetes"))
+m_diabetics = pred_m_diabetes %>%
+  filter(group==1)
+f_diabetics = pred_f_diabetes %>%
+  filter(group==1)
+diabetics = bind_rows(list(a=m_diabetics, b=f_diabetics), .id='group')
+
+ggplot(diabetics, aes(x, predicted, colour=group))+
+  geom_line()+
+  #geom_ribbon(data = m_diabetics, aes(ymin=conf.low, ymax=conf.high), show.legend = F, colour="lightgrey", alpha=0.3)+
+  #geom_ribbon(data = f_diabetics, aes(ymin=conf.low, ymax=conf.high), show.legend = F, colour="lightgrey", alpha=0.3)+ #CIs from predicted model are too narrow to see
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Diabetes",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##Deprivation interaction
+#Female - deprivation
+lme1_f_deprivation <- lmer(CKDEPI_eGFR ~ age*WIMD_2011_QUINTILE + I(ifelse(age<72.6, 0, age-72.6))*WIMD_2011_QUINTILE + (1 | ALF_PE) + smoking_status + Diabetes + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_deprivation_coefs = broom.mixed::tidy(lme1_f_deprivation, conf.int=T)
+#Add coefficients
+#Quintile 1
+dep1_before_f = glht(lme1_f_deprivation, linfct = c("age=0"))
+confint(dep1_before_f)
+dep1_after_f = glht(lme1_f_deprivation, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(dep1_after_f)
+#Quintile 2
+dep2_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2=0"))
+confint(dep2_before_f)
+dep2_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE2:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep2_after_f)
+#Quintile 3
+dep3_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3=0"))
+confint(dep3_before_f)
+dep3_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE3:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep3_after_f)
+#Quintile 4
+dep4_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4=0"))
+confint(dep4_before_f)
+dep4_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE4:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep4_after_f)
+#Quintile 5
+dep5_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5=0"))
+confint(dep5_before_f)
+dep5_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE5:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep5_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_2_int) 
+
+#Male - deprivation
+lme1_m_deprivation <- lmer(CKDEPI_eGFR ~ age*WIMD_2011_QUINTILE + I(ifelse(age<73.8, 0, age-73.8))*WIMD_2011_QUINTILE + (1 | ALF_PE) + smoking_status + Diabetes + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_deprivation_coefs = broom.mixed::tidy(lme1_m_deprivation, conf.int=T)
+#Add coefficients
+#Quintile 1
+dep1_before_m = glht(lme1_m_deprivation, linfct = c("age=0"))
+confint(dep1_before_m)
+dep1_after_m = glht(lme1_m_deprivation, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(dep1_after_m)
+#Quintile 2
+dep2_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2=0"))
+confint(dep2_before_m)
+dep2_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE2:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep2_after_m)
+#Quintile 3
+dep3_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3=0"))
+confint(dep3_before_m)
+dep3_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE3:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep3_after_m)
+#Quintile 4
+dep4_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4=0"))
+confint(dep4_before_m)
+dep4_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE4:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep4_after_m)
+#Quintile 5
+dep5_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5=0"))
+confint(dep5_before_m)
+dep5_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE5:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep5_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_deprivation) 
+
+#Plot
+pred_m_deprivation = ggpredict(lme1_m_deprivation, c("age", "WIMD_2011_QUINTILE"))
+pred_f_deprivation = ggpredict(lme1_f_deprivation, c("age", "WIMD_2011_QUINTILE"))
+m_dep1 = pred_m_deprivation %>%
+  filter(group==1)
+f_dep1 = pred_f_deprivation %>%
+  filter(group==1)
+m_dep5 = pred_m_deprivation %>%
+  filter(group==5)
+f_dep5 = pred_f_deprivation %>%
+  filter(group==5)
+deprivation = bind_rows(list(a=m_dep1, c=f_dep1, b=m_dep5, d=f_dep5), .id='group')
+
+ggplot(deprivation, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Deprivation",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males (most deprived)", "Males (least deprived)", "Females (most deprived)", "Females (least deprived)"),
+                      values = c("dodgerblue4", "deepskyblue1", "firebrick", "tomato1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##Hypertension interaction
+#Female - hypertension
+lme1_f_hypertension <- lmer(CKDEPI_eGFR ~ age*Hypertension + I(ifelse(age<72.6, 0, age-72.6))*Hypertension + (1 | ALF_PE) + smoking_status + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_hypertension_coefs = broom.mixed::tidy(lme1_f_hypertension, conf.int=T)
+#Add coefficients
+htn_before_f = glht(lme1_f_hypertension, linfct = c("age+age:Hypertension1=0"))
+confint(htn_before_f)
+htn_after_f = glht(lme1_f_hypertension, linfct = c("age+age:Hypertension1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Hypertension1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(htn_after_f)
+no_htn_before_f = glht(lme1_f_hypertension, linfct = c("age=0"))
+confint(no_htn_before_f)
+no_htn_after_f = glht(lme1_f_hypertension, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_htn_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_hypertension) 
+
+#Male - hypertension
+lme1_m_hypertension <- lmer(CKDEPI_eGFR ~ age*Hypertension + I(ifelse(age<73.8, 0, age-73.8))*Hypertension + (1 | ALF_PE) + smoking_status + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_hypertension_coefs = broom.mixed::tidy(lme1_m_hypertension, conf.int=T)
+#Add coefficients
+htn_before_m = glht(lme1_m_hypertension, linfct = c("age+age:Hypertension1=0"))
+confint(htn_before_m)
+htn_after_m = glht(lme1_m_hypertension, linfct = c("age+age:Hypertension1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Hypertension1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(htn_after_m)
+no_htn_before_m = glht(lme1_m_hypertension, linfct = c("age=0"))
+confint(no_htn_before_m)
+no_htn_after_m = glht(lme1_m_hypertension, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_htn_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_hypertension) 
+
+#Plot
+pred_f_hypertension = ggpredict(lme1_f_hypertension, c("age", "Hypertension"))
+pred_m_hypertension = ggpredict(lme1_m_hypertension, c("age", "Hypertension"))
+m_hypertension = pred_m_hypertension %>%
+  filter(group==1)
+f_hypertension = pred_f_hypertension %>%
+  filter(group==1)
+hypertension = bind_rows(list(a=m_hypertension, b=f_hypertension), .id='group')
+
+ggplot(hypertension, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Hypertension",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##Smoking interaction
+#Female - smoking
+lme1_f_smoking <- lmer(CKDEPI_eGFR ~ age*smoking_status + I(ifelse(age<72.6, 0, age-72.6))*smoking_status + (1 | ALF_PE) + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_smoking_coefs = broom.mixed::tidy(lme1_f_smoking, conf.int=T)
+#Add coefficients
+#Never smoker
+never_before_f = glht(lme1_f_smoking, linfct = c("age=0"))
+confint(never_before_f)
+never_after_f = glht(lme1_f_smoking, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(never_after_f)
+#Ex-smoker
+ex_before_f = glht(lme1_f_smoking, linfct = c("age+`age:smoking_statusEx-smoker`=0"))
+confint(ex_before_f)
+ex_after_f = glht(lme1_f_smoking, linfct = c("age+`age:smoking_statusEx-smoker`+`I(ifelse(age < 72.6, 0, age - 72.6))`+`smoking_statusEx-smoker:I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(ex_after_f)
+#Smoker
+smok_before_f = glht(lme1_f_smoking, linfct = c("age+age:smoking_statusSmoker=0"))
+confint(smok_before_f)
+smok_after_f = glht(lme1_f_smoking, linfct = c("age+age:smoking_statusSmoker+`I(ifelse(age < 72.6, 0, age - 72.6))`+smoking_statusSmoker:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(smok_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_smoking)
+
+#Male-smoking
+lme1_m_smoking <- lmer(CKDEPI_eGFR ~ age*smoking_status + I(ifelse(age<73.8, 0, age-73.8))*smoking_status + (1 | ALF_PE) + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_smoking_coefs = broom.mixed::tidy(lme1_m_smoking, conf.int=T)
+#Add coefficients
+#Never smoker
+never_before_m = glht(lme1_m_smoking, linfct = c("age=0"))
+confint(never_before_m)
+never_after_m = glht(lme1_m_smoking, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(never_after_m)
+#Ex-smoker
+ex_before_m = glht(lme1_m_smoking, linfct = c("age+`age:smoking_statusEx-smoker`=0"))
+confint(ex_before_m)
+ex_after_m = glht(lme1_m_smoking, linfct = c("age+`age:smoking_statusEx-smoker`+`I(ifelse(age < 73.8, 0, age - 73.8))`+`smoking_statusEx-smoker:I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(ex_after_m)
+#Smoker
+smok_before_m = glht(lme1_m_smoking, linfct = c("age+age:smoking_statusSmoker=0"))
+confint(smok_before_m)
+smok_after_m = glht(lme1_m_smoking, linfct = c("age+age:smoking_statusSmoker+`I(ifelse(age < 73.8, 0, age - 73.8))`+smoking_statusSmoker:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(smok_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_smoking)
+
+#Plot
+pred_f_smoking = ggpredict(lme1_f_smoking, c("age", "smoking_status"))
+pred_m_smoking = ggpredict(lme1_m_smoking, c("age", "smoking_status"))
+m_smoking1 = pred_m_smoking %>%
+  filter(group=="Non_smoker")
+f_smoking1 = pred_f_smoking %>%
+  filter(group=="Non_smoker")
+m_smoking3 = pred_m_smoking %>%
+  filter(group=="Smoker")
+f_smoking3 = pred_f_smoking %>%
+  filter(group=="Smoker")
+smoking = bind_rows(list(a=m_smoking1, b=m_smoking3, c=f_smoking1, d=f_smoking3), .id='group')
+
+ggplot(smoking, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Smoking",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males (non-smoker)", "Males (smoker)", "Females (non-smoker)", "Females (smoker)"),
+                      values = c("dodgerblue4", "deepskyblue1", "firebrick", "tomato1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##PVD interaction
+#Female - PVD
+lme1_f_pvd <- lmer(CKDEPI_eGFR ~ age*Peripheral_vascular_disease + I(ifelse(age<72.6, 0, age-72.6))*Peripheral_vascular_disease + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_pvd_coefs = broom.mixed::tidy(lme1_f_pvd, conf.int=T)
+#Add coefficients
+pvd_before_f = glht(lme1_f_pvd, linfct = c("age+age:Peripheral_vascular_disease1=0"))
+confint(pvd_before_f)
+pvd_after_f = glht(lme1_f_pvd, linfct = c("age+age:Peripheral_vascular_disease1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Peripheral_vascular_disease1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(pvd_after_f)
+no_pvd_before_f = glht(lme1_f_pvd, linfct = c("age=0"))
+confint(no_pvd_before_f)
+no_pvd_after_f = glht(lme1_f_pvd, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_pvd_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_pvd) 
+
+#Male - PVD
+lme1_m_pvd <- lmer(CKDEPI_eGFR ~ age*Peripheral_vascular_disease + I(ifelse(age<73.8, 0, age-73.8))*Peripheral_vascular_disease + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_pvd_coefs = broom.mixed::tidy(lme1_m_pvd, conf.int=T)
+#Add coefficients
+pvd_before_m = glht(lme1_m_pvd, linfct = c("age+age:Peripheral_vascular_disease1=0"))
+confint(pvd_before_m)
+pvd_after_m = glht(lme1_m_pvd, linfct = c("age+age:Peripheral_vascular_disease1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Peripheral_vascular_disease1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(pvd_after_m)
+no_pvd_before_m = glht(lme1_m_pvd, linfct = c("age=0"))
+confint(no_pvd_before_m)
+no_pvd_after_m = glht(lme1_m_pvd, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_pvd_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_pvd) #p< 2.2e-16
+
+#Plot
+pred_f_pvd = ggpredict(lme1_f_pvd, c("age", "Peripheral_vascular_disease"))
+pred_m_pvd = ggpredict(lme1_m_pvd, c("age", "Peripheral_vascular_disease"))
+m_pvd = pred_m_pvd %>%
+  filter(group==1)
+f_pvd = pred_f_pvd %>%
+  filter(group==1)
+pvd = bind_rows(list(a=m_pvd, b=f_pvd), .id='group')
+
+ggplot(pvd, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Peripheral Vascular Disease",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##Heart failure interaction
+#Female - heart failure
+lme1_f_hf <- lmer(CKDEPI_eGFR ~ age*Heart_failure + I(ifelse(age<72.6, 0, age-72.6))*Heart_failure + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_hf_coefs = broom.mixed::tidy(lme1_f_hf, conf.int=T)
+#Add coefficients
+hf_before_f = glht(lme1_f_hf, linfct = c("age+age:Heart_failure1=0"))
+confint(hf_before_f)
+hf_after_f = glht(lme1_f_hf, linfct = c("age+age:Heart_failure1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Heart_failure1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(hf_after_f)
+no_hf_before_f = glht(lme1_f_hf, linfct = c("age=0"))
+confint(no_hf_before_f)
+no_hf_after_f = glht(lme1_f_hf, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_hf_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_hf)
+
+#Male - heart failure
+lme1_m_hf <- lmer(CKDEPI_eGFR ~ age*Heart_failure + I(ifelse(age<73.8, 0, age-73.8))*Heart_failure + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_hf_coefs = broom.mixed::tidy(lme1_m_hf, conf.int=T)
+#Add coefficients
+hf_before_m = glht(lme1_m_hf, linfct = c("age+age:Heart_failure1=0"))
+confint(hf_before_m)
+hf_after_m = glht(lme1_m_hf, linfct = c("age+age:Heart_failure1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Heart_failure1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(hf_after_m)
+no_hf_before_m = glht(lme1_m_hf, linfct = c("age=0"))
+confint(no_hf_before_m)
+no_hf_after_m = glht(lme1_m_hf, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_hf_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_hf)
+
+#Plot
+pred_f_hf = ggpredict(lme1_f_hf, c("age", "Heart_failure"))
+pred_m_hf = ggpredict(lme1_m_hf, c("age", "Heart_failure"))
+m_hf = pred_m_hf %>%
+  filter(group==1)
+f_hf = pred_f_hf %>%
+  filter(group==1)
+hf = bind_rows(list(a=m_hf, b=f_hf), .id='group')
+
+ggplot(hf, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Heart Failure",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##CHD interaction
+#Female - CHD
+wts_f_2 = wts_f_2 %>%
+  mutate(CHD = as.factor(`Coronary Heart disease`))
+lme1_f_chd <- lmer(CKDEPI_eGFR ~ age*CHD + I(ifelse(age<72.6, 0, age-72.6))*CHD + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + Stroke_or_TIA, data=wts_f_2)
+female_chd_coefs = broom.mixed::tidy(lme1_f_chd, conf.int=T)
+#Add coefficients
+chd_before_f = glht(lme1_f_chd, linfct = c("age+age:CHD1=0"))
+confint(chd_before_f)
+chd_after_f = glht(lme1_f_chd, linfct = c("age+age:CHD1+`I(ifelse(age < 72.6, 0, age - 72.6))`+CHD1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(chd_after_f)
+no_chd_before_f = glht(lme1_f_chd, linfct = c("age=0"))
+confint(no_chd_before_f)
+no_chd_after_f = glht(lme1_f_chd, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_chd_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_chd) 
+
+#Male - CHD
+wts_m_2 = wts_m_2 %>%
+  mutate(CHD = as.factor(`Coronary Heart disease`))
+lme1_m_chd <- lmer(CKDEPI_eGFR ~ age*CHD + I(ifelse(age<73.8, 0, age-73.8))*CHD + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + Stroke_or_TIA, data=wts_m_2)
+male_chd_coefs = broom.mixed::tidy(lme1_m_chd, conf.int=T)
+readr::write_csv(male_chd_coefs, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Results/male_chd_coefs.csv")
+#Add coefficients
+chd_before_m = glht(lme1_m_chd, linfct = c("age+age:CHD1=0"))
+confint(chd_before_m)
+chd_after_m = glht(lme1_m_chd, linfct = c("age+age:CHD1+`I(ifelse(age < 73.8, 0, age - 73.8))`+CHD1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(chd_after_m)
+no_chd_before_m = glht(lme1_m_chd, linfct = c("age=0"))
+confint(no_chd_before_m)
+no_chd_after_m = glht(lme1_m_chd, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_chd_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_chd) 
+
+pred_f_chd = ggpredict(lme1_f_chd, c("age", "CHD"))
+pred_m_chd = ggpredict(lme1_m_chd, c("age", "CHD"))
+m_chd = pred_m_chd %>%
+  filter(group==1)
+f_chd = pred_f_chd %>%
+  filter(group==1)
+chd = bind_rows(list(a=m_chd, b=f_chd), .id='group')
+
+ggplot(chd, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Coronary Heart Disease",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##Stroke interaction
+#Female - stroke
+lme1_f_stroke <- lmer(CKDEPI_eGFR ~ age*Stroke_or_TIA + I(ifelse(age<72.6, 0, age-72.6))*Stroke_or_TIA + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + CHD, data=wts_f_2)
+female_stroke_coefs = broom.mixed::tidy(lme1_f_stroke, conf.int=T)
+#Add coefficients
+stroke_before_f = glht(lme1_f_stroke, linfct = c("age+age:Stroke_or_TIA1=0"))
+confint(stroke_before_f)
+stroke_after_f = glht(lme1_f_stroke, linfct = c("age+age:Stroke_or_TIA1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Stroke_or_TIA1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(stroke_after_f)
+no_stroke_before_f = glht(lme1_f_stroke, linfct = c("age=0"))
+confint(no_stroke_before_f)
+no_stroke_after_f = glht(lme1_f_stroke, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_stroke_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_stroke) 
+
+#Male - stroke
+lme1_m_stroke <- lmer(CKDEPI_eGFR ~ age*Stroke_or_TIA + I(ifelse(age<73.8, 0, age-73.8))*Stroke_or_TIA + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + CHD, data=wts_m_2)
+male_stroke_coefs = broom.mixed::tidy(lme1_m_stroke, conf.int=T)
+readr::write_csv(male_stroke_coefs, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Results/male_stroke_coefs.csv")
+stroke_before_m = glht(lme1_m_stroke, linfct = c("age+age:Stroke_or_TIA1=0"))
+confint(stroke_before_m)
+stroke_after_m = glht(lme1_m_stroke, linfct = c("age+age:Stroke_or_TIA1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Stroke_or_TIA1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(stroke_after_m)
+no_stroke_before_m = glht(lme1_m_stroke, linfct = c("age=0"))
+confint(no_stroke_before_m)
+no_stroke_after_m = glht(lme1_m_stroke, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_stroke_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_stroke)
+
+pred_f_stroke = ggpredict(lme1_f_stroke, c("age", "Stroke_or_TIA"))
+pred_m_stroke = ggpredict(lme1_m_stroke, c("age", "Stroke_or_TIA"))
+m_stroke = pred_m_stroke %>%
+  filter(group==1)
+f_stroke = pred_f_stroke %>%
+  filter(group==1)
+stroke = bind_rows(list(a=m_stroke, b=f_stroke), .id='group')
+
+ggplot(stroke, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Stroke or TIA",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+##AF interaction
+#Female - AF
+lme1_f_af <- lmer(CKDEPI_eGFR ~ age*Atrial_fibrillation + I(ifelse(age<72.6, 0, age-72.6))*Atrial_fibrillation + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_af_coefs = broom.mixed::tidy(lme1_f_af, conf.int=T)
+#Add coefficients
+af_before_f = glht(lme1_f_af, linfct = c("age+age:Atrial_fibrillation1=0"))
+confint(af_before_f)
+af_after_f = glht(lme1_f_af, linfct = c("age+age:Atrial_fibrillation1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Atrial_fibrillation1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(af_after_f)
+no_af_before_f = glht(lme1_f_af, linfct = c("age=0"))
+confint(no_af_before_f)
+no_af_after_f = glht(lme1_f_af, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_af_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_af) 
+
+#Male - AF
+lme1_m_af <- lmer(CKDEPI_eGFR ~ age*Atrial_fibrillation + I(ifelse(age<73.8, 0, age-73.8))*Atrial_fibrillation + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_af_coefs = broom.mixed::tidy(lme1_m_af, conf.int=T)
+#Add coefficients
+af_before_m = glht(lme1_m_af, linfct = c("age+age:Atrial_fibrillation1=0"))
+confint(af_before_m)
+af_after_m = glht(lme1_m_af, linfct = c("age+age:Atrial_fibrillation1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Atrial_fibrillation1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(af_after_m)
+no_af_before_m = glht(lme1_m_af, linfct = c("age=0"))
+confint(no_af_before_m)
+no_af_after_m = glht(lme1_m_af, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_af_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_af)
+
+pred_m_af = ggpredict(lme1_m_af, c("age", "Atrial_fibrillation"))
+pred_f_af = ggpredict(lme1_f_af, c("age", "Atrial_fibrillation"))
+m_af = pred_m_af %>%
+  filter(group==1)
+f_af = pred_f_af %>%
+  filter(group==1)
+af = bind_rows(list(a=m_af, b=f_af), .id='group')
+
+ggplot(af, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Atrial Fibrillation",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+```
+
+```{r Interaction models with plots}
+#Plotting LMM stratified by sex - does not work
+lme_m <- lmer(CKDEPI_eGFR ~ age + (1|ALF_PE), subset = sex=="Male", data=long_cohort_v3)
+pred_m = ggpredict(lme_m, terms = c("age", "sex"))
+model_m = plot(pred_m) +
+  scale_x_continuous(limits = c(18,100))+
+  scale_y_continuous(limits = c(0,150))
+lme_f <- lmer(CKDEPI_eGFR ~ age + (1|ALF_PE), subset = sex=="Female", data=long_cohort_v3)
+pred_f = ggpredict(lme_f, terms = c("age", "sex"))
+model_f = plot(pred_f)+
+  scale_x_continuous(limits = c(18,100))+
+  scale_y_continuous(limits = c(0,150))
+combined_plot = model_m+model_f
+
+wts_f_2 = long_cohort_v3 %>%
+  filter(!is.na(smoking_status) & !is.na(WIMD_2011_QUINTILE)) %>%
+  mutate(age.1 = ifelse(age<72.6, 0, age-72.6)) %>%
+  filter(sex=="Female") %>%
+  mutate(WIMD_2011_QUINTILE = as.factor(WIMD_2011_QUINTILE)) %>%
+  mutate(Peripheral_vascular_disease = as.factor(Peripheral_vascular_disease)) %>%
+  mutate(Atrial_fibrillation = as.factor(Atrial_fibrillation)) %>%
+  mutate(`Coronary Heart disease` = as.factor(`Coronary Heart disease`)) %>%
+  mutate(Stroke_or_TIA = as.factor(Stroke_or_TIA))
+lme1_f_2 <- lmer(CKDEPI_eGFR ~ age + I(ifelse(age<72.6, 0, age-72.6)) + (1 | ALF_PE) + Diabetes + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+
+wts_m_2 = long_cohort_v3 %>%
+  filter(!is.na(smoking_status) & !is.na(WIMD_2011_QUINTILE)) %>%
+  mutate(age.1 = ifelse(age<73.8, 0, age-73.8)) %>%
+  filter(sex=="Male") %>%
+  mutate(WIMD_2011_QUINTILE = as.factor(WIMD_2011_QUINTILE)) %>%
+  mutate(Peripheral_vascular_disease = as.factor(Peripheral_vascular_disease)) %>%
+  mutate(Atrial_fibrillation = as.factor(Atrial_fibrillation)) %>%
+  mutate(`Coronary Heart disease` = as.factor(`Coronary Heart disease`)) %>%
+  mutate(Stroke_or_TIA = as.factor(Stroke_or_TIA))
+lme1_m_2 <- lmer(CKDEPI_eGFR ~ age + I(ifelse(age<73.8, 0, age-73.8)) + (1 | ALF_PE) + Diabetes + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+
+##Diabetes interaction
+#Female - diabetes
+lme1_f_diabetes <- lmer(CKDEPI_eGFR ~ age*Diabetes + I(ifelse(age<72.6, 0, age-72.6))*Diabetes + (1 | ALF_PE) + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_diabetes_coefs = broom.mixed::tidy(lme1_f_diabetes, conf.int=T)
+#Add coefficients
+dm_before_f = glht(lme1_f_diabetes, linfct = c("age+age:Diabetes1=0"))
+confint(dm_before_f)
+dm_after_f = glht(lme1_f_diabetes, linfct = c("age+age:Diabetes1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Diabetes1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dm_after_f)
+no_dm_before_f = glht(lme1_f_diabetes, linfct = c("age=0"))
+confint(no_dm_before_f)
+no_dm_after_f = glht(lme1_f_diabetes, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_dm_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_diabetes) #p< 2.2e-16
+#Plot
+pred_f_diabetes = ggpredict(lme1_f_diabetes, c("age", "Diabetes"))
+model_int_f_diab = plot(pred_f_diabetes) +
+  geom_ribbon(aes(ymin=conf.low, ymax=conf.high, alpha=0.4))+
+  scale_x_continuous(limits = c(18,100))+
+    scale_y_continuous(limits = c(0,130), breaks = c(0, 40, 80, 120)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_color_manual(name="",
+                     labels = c("No Diabetes", "Diabetes"),
+                     values = c("dodgerblue", "firebrick1"))
+
+#Male - diabetes
+lme1_m_diabetes <- lmer(CKDEPI_eGFR ~ age*Diabetes + I(ifelse(age<73.8, 0, age-73.8))*Diabetes + (1 | ALF_PE) + smoking_status + WIMD_2011_QUINTILE + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_diabetes_coefs = broom.mixed::tidy(lme1_m_diabetes, conf.int=T)
+#Add coefficients
+dm_before_m = glht(lme1_m_diabetes, linfct = c("age+age:Diabetes1=0"))
+confint(dm_before_m)
+dm_after_m = glht(lme1_m_diabetes, linfct = c("age+age:Diabetes1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Diabetes1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dm_after_m)
+no_dm_before_m = glht(lme1_m_diabetes, linfct = c("age=0"))
+confint(no_dm_before_m)
+no_dm_after_m = glht(lme1_m_diabetes, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_dm_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_diabetes) #p< 2.2e-16
+#Plot
+pred_m_diabetes = ggpredict(lme1_m_diabetes, c("age", "Diabetes"))
+model_int_m_diab = plot(pred_m_diabetes) +
+  scale_x_continuous(limits = c(18,100))+
+    scale_y_continuous(limits = c(0,130), breaks = c(0, 40, 80, 120)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)))+
+  scale_color_manual(name="",
+                     labels = c("No Diabetes", "Diabetes"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_diab+model_int_m_diab
+
+##Deprivation interaction
+#Female - deprivation
+lme1_f_deprivation <- lmer(CKDEPI_eGFR ~ age*WIMD_2011_QUINTILE + I(ifelse(age<72.6, 0, age-72.6))*WIMD_2011_QUINTILE + (1 | ALF_PE) + smoking_status + Diabetes + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_deprivation_coefs = broom.mixed::tidy(lme1_f_deprivation, conf.int=T)
+#Add coefficients
+#Quintile 1
+dep1_before_f = glht(lme1_f_deprivation, linfct = c("age=0"))
+confint(dep1_before_f)
+dep1_after_f = glht(lme1_f_deprivation, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(dep1_after_f)
+#Quintile 2
+dep2_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2=0"))
+confint(dep2_before_f)
+dep2_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE2:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep2_after_f)
+#Quintile 3
+dep3_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3=0"))
+confint(dep3_before_f)
+dep3_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE3:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep3_after_f)
+#Quintile 4
+dep4_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4=0"))
+confint(dep4_before_f)
+dep4_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE4:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep4_after_f)
+#Quintile 5
+dep5_before_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5=0"))
+confint(dep5_before_f)
+dep5_after_f = glht(lme1_f_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5+`I(ifelse(age < 72.6, 0, age - 72.6))`+WIMD_2011_QUINTILE5:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(dep5_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_2_int) #p< 2.2e-16
+#Plot
+pred_f_deprivation = ggpredict(lme1_f_deprivation, c("age", "WIMD_2011_QUINTILE"))
+model_int_f_depr = plot(pred_f_deprivation) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Deprivation quintile")+
+  scale_color_manual(name="Deprivation quintile",
+                     labels = c("1 (Most deprived)", "2", "3", "4", "5 (Least deprived)"),
+                     values = c("#feebe2", "#fbb4b9", "#f768a1", "#c51b8a", "#7a0177"))
+
+#Male - deprivation
+lme1_m_deprivation <- lmer(CKDEPI_eGFR ~ age*WIMD_2011_QUINTILE + I(ifelse(age<73.8, 0, age-73.8))*WIMD_2011_QUINTILE + (1 | ALF_PE) + smoking_status + Diabetes + Hypertension + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_deprivation_coefs = broom.mixed::tidy(lme1_m_deprivation, conf.int=T)
+#Add coefficients
+#Quintile 1
+dep1_before_m = glht(lme1_m_deprivation, linfct = c("age=0"))
+confint(dep1_before_m)
+dep1_after_m = glht(lme1_m_deprivation, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(dep1_after_m)
+#Quintile 2
+dep2_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2=0"))
+confint(dep2_before_m)
+dep2_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE2+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE2:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep2_after_m)
+#Quintile 3
+dep3_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3=0"))
+confint(dep3_before_m)
+dep3_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE3+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE3:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep3_after_m)
+#Quintile 4
+dep4_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4=0"))
+confint(dep4_before_m)
+dep4_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE4+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE4:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep4_after_m)
+#Quintile 5
+dep5_before_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5=0"))
+confint(dep5_before_m)
+dep5_after_m = glht(lme1_m_deprivation, linfct = c("age+age:WIMD_2011_QUINTILE5+`I(ifelse(age < 73.8, 0, age - 73.8))`+WIMD_2011_QUINTILE5:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(dep5_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_deprivation) #p< 2.2e-16
+#Plot
+pred_m_deprivation = ggpredict(lme1_m_deprivation, c("age", "WIMD_2011_QUINTILE"))
+model_int_m_depr = plot(pred_m_deprivation) +
+  scale_x_continuous(limits = c(18,100)) +
+    scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Deprivation quintile")+
+  scale_color_manual(name="Deprivation quintile",
+                     labels = c("1 (Most deprived)", "2", "3", "4", "5 (Least deprived)"),
+                     values = c("#feebe2", "#fbb4b9", "#f768a1", "#c51b8a", "#7a0177"))+
+  theme(legend.position = "none")
+
+model_int_f_depr+model_int_m_depr
+
+##Hypertension interaction
+#Female - hypertension
+lme1_f_hypertension <- lmer(CKDEPI_eGFR ~ age*Hypertension + I(ifelse(age<72.6, 0, age-72.6))*Hypertension + (1 | ALF_PE) + smoking_status + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_hypertension_coefs = broom.mixed::tidy(lme1_f_hypertension, conf.int=T)
+#Add coefficients
+htn_before_f = glht(lme1_f_hypertension, linfct = c("age+age:Hypertension1=0"))
+confint(htn_before_f)
+htn_after_f = glht(lme1_f_hypertension, linfct = c("age+age:Hypertension1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Hypertension1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(htn_after_f)
+no_htn_before_f = glht(lme1_f_hypertension, linfct = c("age=0"))
+confint(no_htn_before_f)
+no_htn_after_f = glht(lme1_f_hypertension, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_htn_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_hypertension) #p< 2.2e-16
+#Plot
+pred_f_hypertension = ggpredict(lme1_f_hypertension, c("age", "Hypertension"))
+model_int_f_htn = plot(pred_f_hypertension) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Hypertension")+
+  scale_color_manual(name="Hypertension",
+                     labels = c("No hypertension", "Hypertension"),
+                     values = c("dodgerblue", "firebrick1"))
+#Male - hypertension
+lme1_m_hypertension <- lmer(CKDEPI_eGFR ~ age*Hypertension + I(ifelse(age<73.8, 0, age-73.8))*Hypertension + (1 | ALF_PE) + smoking_status + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_hypertension_coefs = broom.mixed::tidy(lme1_m_hypertension, conf.int=T)
+#Add coefficients
+htn_before_m = glht(lme1_m_hypertension, linfct = c("age+age:Hypertension1=0"))
+confint(htn_before_m)
+htn_after_m = glht(lme1_m_hypertension, linfct = c("age+age:Hypertension1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Hypertension1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(htn_after_m)
+no_htn_before_m = glht(lme1_m_hypertension, linfct = c("age=0"))
+confint(no_htn_before_m)
+no_htn_after_m = glht(lme1_m_hypertension, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_htn_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_hypertension) #p< 2.2e-16
+pred_m_hypertension = ggpredict(lme1_m_hypertension, c("age", "Hypertension"))
+model_int_m_htn = plot(pred_m_hypertension) +
+  scale_x_continuous(limits = c(18,100)) +
+    scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Hypertension")+
+  scale_color_manual(name="Hypertension",
+                     labels = c("No hypertension", "Hypertension"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_htn+model_int_m_htn
+
+##Smoking interaction
+#Female - smoking
+lme1_f_smoking <- lmer(CKDEPI_eGFR ~ age*smoking_status + I(ifelse(age<72.6, 0, age-72.6))*smoking_status + (1 | ALF_PE) + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_smoking_coefs = broom.mixed::tidy(lme1_f_smoking, conf.int=T)
+#Add coefficients
+#Never smoker
+never_before_f = glht(lme1_f_smoking, linfct = c("age=0"))
+confint(never_before_f)
+never_after_f = glht(lme1_f_smoking, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(never_after_f)
+#Ex-smoker
+ex_before_f = glht(lme1_f_smoking, linfct = c("age+`age:smoking_statusEx-smoker`=0"))
+confint(ex_before_f)
+ex_after_f = glht(lme1_f_smoking, linfct = c("age+`age:smoking_statusEx-smoker`+`I(ifelse(age < 72.6, 0, age - 72.6))`+`smoking_statusEx-smoker:I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(ex_after_f)
+#Smoker
+smok_before_f = glht(lme1_f_smoking, linfct = c("age+age:smoking_statusSmoker=0"))
+confint(smok_before_f)
+smok_after_f = glht(lme1_f_smoking, linfct = c("age+age:smoking_statusSmoker+`I(ifelse(age < 72.6, 0, age - 72.6))`+smoking_statusSmoker:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(smok_after_f)
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_smoking) #p< 2.2e-16
+#Plot
+pred_f_smoking = ggpredict(lme1_f_smoking, c("age", "smoking_status"))
+model_int_f_smok = plot(pred_f_smoking) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "smoking_status")+
+  scale_color_manual(name="Smoking status",
+                     labels = c("Non-smoker", "Ex-smoker", "Smoker"),
+                     values = c("darkgreen", "blue", "red"))
+#Male-smoking
+lme1_m_smoking <- lmer(CKDEPI_eGFR ~ age*smoking_status + I(ifelse(age<73.8, 0, age-73.8))*smoking_status + (1 | ALF_PE) + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_smoking_coefs = broom.mixed::tidy(lme1_m_smoking, conf.int=T)
+#Add coefficients
+#Never smoker
+never_before_m = glht(lme1_m_smoking, linfct = c("age=0"))
+confint(never_before_m)
+never_after_m = glht(lme1_m_smoking, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(never_after_m)
+#Ex-smoker
+ex_before_m = glht(lme1_m_smoking, linfct = c("age+`age:smoking_statusEx-smoker`=0"))
+confint(ex_before_m)
+ex_after_m = glht(lme1_m_smoking, linfct = c("age+`age:smoking_statusEx-smoker`+`I(ifelse(age < 73.8, 0, age - 73.8))`+`smoking_statusEx-smoker:I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(ex_after_m)
+#Smoker
+smok_before_m = glht(lme1_m_smoking, linfct = c("age+age:smoking_statusSmoker=0"))
+confint(smok_before_m)
+smok_after_m = glht(lme1_m_smoking, linfct = c("age+age:smoking_statusSmoker+`I(ifelse(age < 73.8, 0, age - 73.8))`+smoking_statusSmoker:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(smok_after_m)
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_smoking) #p< 2.2e-16
+#Plot
+pred_m_smoking = ggpredict(lme1_m_smoking, c("age", "smoking_status"))
+model_int_m_smok = plot(pred_m_smoking) +
+  scale_x_continuous(limits = c(18,100)) +
+    scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "smoking_status")+
+  scale_color_manual(name="Smoking status",
+                     labels = c("Non-smoker", "Ex-smoker", "Smoker"),
+                     values = c("darkgreen", "blue", "red"))+
+  theme(legend.position = "none")
+
+model_int_f_smok+model_int_m_smok
+
+##PVD interaction
+#Female - PVD
+lme1_f_pvd <- lmer(CKDEPI_eGFR ~ age*Peripheral_vascular_disease + I(ifelse(age<72.6, 0, age-72.6))*Peripheral_vascular_disease + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_pvd_coefs = broom.mixed::tidy(lme1_f_pvd, conf.int=T)
+#Add coefficients
+pvd_before_f = glht(lme1_f_pvd, linfct = c("age+age:Peripheral_vascular_disease1=0"))
+confint(pvd_before_f)
+pvd_after_f = glht(lme1_f_pvd, linfct = c("age+age:Peripheral_vascular_disease1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Peripheral_vascular_disease1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(pvd_after_f)
+no_pvd_before_f = glht(lme1_f_pvd, linfct = c("age=0"))
+confint(no_pvd_before_f)
+no_pvd_after_f = glht(lme1_f_pvd, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_pvd_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_pvd) #p = 2.37e-13
+pred_f_pvd = ggpredict(lme1_f_pvd, c("age", "Peripheral_vascular_disease"))
+model_int_f_pvd = plot(pred_f_pvd) +
+  geom_ribbon(aes(ymin=conf.low, ymax=conf.high, alpha=0.4))+
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Peripheral_vascular_disease")+
+  scale_color_manual(name="",
+                     labels = c("No peripheral vascular disease", "Peripheral vascular disease"),
+                     values = c("dodgerblue", "firebrick1"))
+#Male - PVD
+lme1_m_pvd <- lmer(CKDEPI_eGFR ~ age*Peripheral_vascular_disease + I(ifelse(age<73.8, 0, age-73.8))*Peripheral_vascular_disease + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Atrial_fibrillation + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_pvd_coefs = broom.mixed::tidy(lme1_m_pvd, conf.int=T)
+#Add coefficients
+pvd_before_m = glht(lme1_m_pvd, linfct = c("age+age:Peripheral_vascular_disease1=0"))
+confint(pvd_before_m)
+pvd_after_m = glht(lme1_m_pvd, linfct = c("age+age:Peripheral_vascular_disease1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Peripheral_vascular_disease1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(pvd_after_m)
+no_pvd_before_m = glht(lme1_m_pvd, linfct = c("age=0"))
+confint(no_pvd_before_m)
+no_pvd_after_m = glht(lme1_m_pvd, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_pvd_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_pvd) #p< 2.2e-16
+pred_m_pvd = ggpredict(lme1_m_pvd, c("age", "Peripheral_vascular_disease"))
+model_int_m_pvd = plot(pred_m_pvd) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Peripheral_vascular_disease")+
+  scale_color_manual(name="",
+                     labels = c("No peripheral vascular disease", "Peripheral vascular disease"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_pvd+model_int_m_pvd
+
+##AF interaction
+#Female - AF
+lme1_f_af <- lmer(CKDEPI_eGFR ~ age*Atrial_fibrillation + I(ifelse(age<72.6, 0, age-72.6))*Atrial_fibrillation + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_af_coefs = broom.mixed::tidy(lme1_f_af, conf.int=T)
+#Add coefficients
+af_before_f = glht(lme1_f_af, linfct = c("age+age:Atrial_fibrillation1=0"))
+confint(af_before_f)
+af_after_f = glht(lme1_f_af, linfct = c("age+age:Atrial_fibrillation1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Atrial_fibrillation1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(af_after_f)
+no_af_before_f = glht(lme1_f_af, linfct = c("age=0"))
+confint(no_af_before_f)
+no_af_after_f = glht(lme1_f_af, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_af_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_af) #p< 2.2e-16
+pred_f_af = ggpredict(lme1_f_af, c("age", "Atrial_fibrillation"))
+model_int_f_af = plot(pred_f_af) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Atrial_fibrillation")+
+  scale_color_manual(name="",
+                     labels = c("No AF", "AF"),
+                     values = c("dodgerblue", "firebrick1"))
+#Male - AF
+lme1_m_af <- lmer(CKDEPI_eGFR ~ age*Atrial_fibrillation + I(ifelse(age<73.8, 0, age-73.8))*Atrial_fibrillation + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Heart_failure + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_af_coefs = broom.mixed::tidy(lme1_m_af, conf.int=T)
+#Add coefficients
+af_before_m = glht(lme1_m_af, linfct = c("age+age:Atrial_fibrillation1=0"))
+confint(af_before_m)
+af_after_m = glht(lme1_m_af, linfct = c("age+age:Atrial_fibrillation1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Atrial_fibrillation1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(af_after_m)
+no_af_before_m = glht(lme1_m_af, linfct = c("age=0"))
+confint(no_af_before_m)
+no_af_after_m = glht(lme1_m_af, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_af_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_af) #p< 2.2e-16
+pred_m_af = ggpredict(lme1_m_af, c("age", "Atrial_fibrillation"))
+model_int_m_af = plot(pred_m_af) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Atrial_fibrillation")+
+  scale_color_manual(name="",
+                     labels = c("No AF", "AF"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_af+model_int_m_af
+
+##Heart failure interaction
+#Female - heart failure
+lme1_f_hf <- lmer(CKDEPI_eGFR ~ age*Heart_failure + I(ifelse(age<72.6, 0, age-72.6))*Heart_failure + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + `Coronary Heart disease` + Stroke_or_TIA, data=wts_f_2)
+female_hf_coefs = broom.mixed::tidy(lme1_f_hf, conf.int=T)
+#Add coefficients
+hf_before_f = glht(lme1_f_hf, linfct = c("age+age:Heart_failure1=0"))
+confint(hf_before_f)
+hf_after_f = glht(lme1_f_hf, linfct = c("age+age:Heart_failure1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Heart_failure1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(hf_after_f)
+no_hf_before_f = glht(lme1_f_hf, linfct = c("age=0"))
+confint(no_hf_before_f)
+no_hf_after_f = glht(lme1_f_hf, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_hf_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_hf) #p< 2.2e-16
+pred_f_hf = ggpredict(lme1_f_hf, c("age", "Heart_failure"))
+model_int_f_hf = plot(pred_f_hf) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Heart_failure")+
+  scale_color_manual(name="",
+                     labels = c("No heart failure", "Heart failure"),
+                     values = c("dodgerblue", "firebrick1"))
+#Male - heart failure
+lme1_m_hf <- lmer(CKDEPI_eGFR ~ age*Heart_failure + I(ifelse(age<73.8, 0, age-73.8))*Heart_failure + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + `Coronary Heart disease` + Stroke_or_TIA, data=wts_m_2)
+male_hf_coefs = broom.mixed::tidy(lme1_m_hf, conf.int=T)
+#Add coefficients
+hf_before_m = glht(lme1_m_hf, linfct = c("age+age:Heart_failure1=0"))
+confint(hf_before_m)
+hf_after_m = glht(lme1_m_hf, linfct = c("age+age:Heart_failure1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Heart_failure1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(hf_after_m)
+no_hf_before_m = glht(lme1_m_hf, linfct = c("age=0"))
+confint(no_hf_before_m)
+no_hf_after_m = glht(lme1_m_hf, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_hf_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_hf) #p< 2.2e-16
+#Plot
+pred_m_hf = ggpredict(lme1_m_hf, c("age", "Heart_failure"))
+model_int_m_hf = plot(pred_m_hf) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Heart_failure")+
+  scale_color_manual(name="",
+                     labels = c("No heart failure", "Heart failure"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_hf+model_int_m_hf
+
+##CHD interaction
+#Female - CHD
+wts_f_2 = wts_f_2 %>%
+  mutate(CHD = as.factor(`Coronary Heart disease`))
+lme1_f_chd <- lmer(CKDEPI_eGFR ~ age*CHD + I(ifelse(age<72.6, 0, age-72.6))*CHD + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + Stroke_or_TIA, data=wts_f_2)
+female_chd_coefs = broom.mixed::tidy(lme1_f_chd, conf.int=T)
+#Add coefficients
+chd_before_f = glht(lme1_f_chd, linfct = c("age+age:CHD1=0"))
+confint(chd_before_f)
+chd_after_f = glht(lme1_f_chd, linfct = c("age+age:CHD1+`I(ifelse(age < 72.6, 0, age - 72.6))`+CHD1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(chd_after_f)
+no_chd_before_f = glht(lme1_f_chd, linfct = c("age=0"))
+confint(no_chd_before_f)
+no_chd_after_f = glht(lme1_f_chd, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_chd_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_chd) #p< 2.2e-16
+pred_f_chd = ggpredict(lme1_f_chd, c("age", "CHD"))
+model_int_f_chd = plot(pred_f_chd) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,130), breaks = c(0, 40, 80, 120)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "CHD")+
+  scale_color_manual(name="",
+                     labels = c("No CHD", "CHD"),
+                     values = c("dodgerblue", "firebrick1"))
+#Male - CHD
+wts_m_2 = wts_m_2 %>%
+  mutate(CHD = as.factor(`Coronary Heart disease`))
+lme1_m_chd <- lmer(CKDEPI_eGFR ~ age*CHD + I(ifelse(age<73.8, 0, age-73.8))*CHD + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + Stroke_or_TIA, data=wts_m_2)
+male_chd_coefs = broom.mixed::tidy(lme1_m_chd, conf.int=T)
+#Add coefficients
+chd_before_m = glht(lme1_m_chd, linfct = c("age+age:CHD1=0"))
+confint(chd_before_m)
+chd_after_m = glht(lme1_m_chd, linfct = c("age+age:CHD1+`I(ifelse(age < 73.8, 0, age - 73.8))`+CHD1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(chd_after_m)
+no_chd_before_m = glht(lme1_m_chd, linfct = c("age=0"))
+confint(no_chd_before_m)
+no_chd_after_m = glht(lme1_m_chd, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_chd_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_chd) #p< 2.2e-16
+pred_m_chd = ggpredict(lme1_m_chd, c("age", "CHD"))
+model_int_m_chd = plot(pred_m_chd) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,130), breaks = c(0, 40, 80, 120)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "CHD")+
+  scale_color_manual(name="",
+                     labels = c("No CHD", "CHD"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_chd+model_int_m_chd
+
+##Stroke interaction
+#Female - stroke
+lme1_f_stroke <- lmer(CKDEPI_eGFR ~ age*Stroke_or_TIA + I(ifelse(age<72.6, 0, age-72.6))*Stroke_or_TIA + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + CHD, data=wts_f_2)
+female_stroke_coefs = broom.mixed::tidy(lme1_f_stroke, conf.int=T)
+#Add coefficients
+stroke_before_f = glht(lme1_f_stroke, linfct = c("age+age:Stroke_or_TIA1=0"))
+confint(stroke_before_f)
+stroke_after_f = glht(lme1_f_stroke, linfct = c("age+age:Stroke_or_TIA1+`I(ifelse(age < 72.6, 0, age - 72.6))`+Stroke_or_TIA1:I(ifelse(age < 72.6, 0, age - 72.6))=0"))
+confint(stroke_after_f)
+no_stroke_before_f = glht(lme1_f_stroke, linfct = c("age=0"))
+confint(no_stroke_before_f)
+no_stroke_after_f = glht(lme1_f_stroke, linfct = c("age+`I(ifelse(age < 72.6, 0, age - 72.6))`=0"))
+confint(no_stroke_after_f)
+
+#Compare with standard model
+lmtest::lrtest(lme1_f_2, lme1_f_stroke) #p< 2.2e-16
+pred_f_stroke = ggpredict(lme1_f_stroke, c("age", "Stroke_or_TIA"))
+model_int_f_stroke = plot(pred_f_stroke) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Females",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Stroke_or_TIA")+
+  scale_color_manual(name="",
+                     labels = c("No stroke", "Stroke"),
+                     values = c("dodgerblue", "firebrick1"))
+#Male - stroke
+lme1_m_stroke <- lmer(CKDEPI_eGFR ~ age*Stroke_or_TIA + I(ifelse(age<73.8, 0, age-73.8))*Stroke_or_TIA + (1 | ALF_PE) + smoking_status + Hypertension + Diabetes + WIMD_2011_QUINTILE + Peripheral_vascular_disease + Atrial_fibrillation + Heart_failure + CHD, data=wts_m_2)
+male_stroke_coefs = broom.mixed::tidy(lme1_m_stroke, conf.int=T)
+readr::write_csv(male_stroke_coefs, file = "S:/1214 - The Relationship Between Cancer and Kidney Disease/SHE-ROCKS/Results/male_stroke_coefs.csv")
+stroke_before_m = glht(lme1_m_stroke, linfct = c("age+age:Stroke_or_TIA1=0"))
+confint(stroke_before_m)
+stroke_after_m = glht(lme1_m_stroke, linfct = c("age+age:Stroke_or_TIA1+`I(ifelse(age < 73.8, 0, age - 73.8))`+Stroke_or_TIA1:I(ifelse(age < 73.8, 0, age - 73.8))=0"))
+confint(stroke_after_m)
+no_stroke_before_m = glht(lme1_m_stroke, linfct = c("age=0"))
+confint(no_stroke_before_m)
+no_stroke_after_m = glht(lme1_m_stroke, linfct = c("age+`I(ifelse(age < 73.8, 0, age - 73.8))`=0"))
+confint(no_stroke_after_m)
+
+#Compare with standard model
+lmtest::lrtest(lme1_m_2, lme1_m_stroke) #p< 2.2e-16
+pred_m_stroke = ggpredict(lme1_m_stroke, c("age", "Stroke_or_TIA"))
+model_int_m_stroke = plot(pred_m_stroke) +
+  scale_x_continuous(limits = c(18,100)) +
+  scale_y_continuous(limits = c(0,125)) +
+  labs(title = "Males",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2)),
+       color = "Stroke_or_TIA")+
+  scale_color_manual(name="",
+                     labels = c("No stroke", "Stroke"),
+                     values = c("dodgerblue", "firebrick1"))+
+  theme(legend.position = "none")
+
+model_int_f_stroke+model_int_m_stroke
+
+m_diabetics = pred_m_diabetes %>%
+  filter(group==1)
+f_diabetics = pred_f_diabetes %>%
+  filter(group==1)
+diabetics = bind_rows(list(a=m_diabetics, b=f_diabetics), .id='group')
+
+ggplot(diabetics, aes(x, predicted, colour=group))+
+  geom_line()+
+  scale_y_continuous(limits = c(0,140), breaks = c(0, 40, 80, 120))+
+  scale_x_continuous(limits = c(18,100)) +
+  labs(title = "Diabetes",
+       x = "Age (years)",
+       y = expression(eGFR ~ (mL / min / 1.73 ~ m^2))) +
+  scale_colour_manual(labels = c("Males", "Females"),
+                      values = c("dodgerblue", "firebrick1"))+
+  theme_bw() +
+  theme(legend.title = element_blank())
+```
